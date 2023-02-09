@@ -7,7 +7,7 @@ use_8bit_adam: True
 train_batch_size: 4
 img_data_path: "/grogu/user/akirchme/art3d_sd_webui/multiview/horse"
 meta_data_file: "/grogu/user/akirchme/art3d_sd_webui/metadata/horse/multiview.csv"
-mae_checkpoint_path: "/grogu/user/akirchme/art3d_sd_webui/mae/checkpoints"
+mae_checkpoint_path: "/grogu/user/akirchme/pretrained/mae"
 resolution: 512
 num_train_epochs: 5
 
