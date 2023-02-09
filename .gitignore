@@ -1,0 +1,6 @@
+**/__pycache__
+**/checkpoints
+data
+outputs
+**/.ipynb_checkpoints
+**/output
