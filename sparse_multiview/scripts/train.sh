@@ -1,1 +1,2 @@
-accelerate launch train.py --config configs/base.yaml
+accelerate launch --config_file configs/accelerator.yaml train.py --config configs/views5.yaml
+accelerate launch --config_file configs/accelerator.yaml --multi_gpu --num_processes 2 train.py --config configs/views5.yaml
