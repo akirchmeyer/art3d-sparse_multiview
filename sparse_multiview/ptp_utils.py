@@ -56,7 +56,7 @@ def view_images(images: Union[np.ndarray, List],
     return pil_img
 
 
-def register_attention_control(model, controller, unregister=False):
+def register_attention_control(unet, controller, unregister=False):
     def new_processor(
             attn: CrossAttention,
             hidden_states,
@@ -106,7 +106,7 @@ def register_attention_control(model, controller, unregister=False):
         return count
 
     cross_att_count = 0
-    sub_nets = model.unet.named_children()
+    sub_nets = unet.named_children()
     for net in sub_nets:
         if "down" in net[0]:
             cross_att_count += register_recr(net[1], 0, "down", unregister)
@@ -231,6 +231,6 @@ def aggregate_attention(attention_store: AttentionStore,
     out = out.sum(0) / out.shape[0]
     return out
 
-def visualize_crossattention_map(model, input, res=16):
+def visualize_crossattention_map(unet, input, res=16):
     controller = AttentionStore()
-    register_attention_control(model, controller)
+    register_attention_control(unet, controller)

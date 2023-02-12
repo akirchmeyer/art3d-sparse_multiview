@@ -8,6 +8,7 @@ from torchvision import transforms
 import numpy as np
 import itertools
 
+from types import SimpleNamespace
 from diffusers import AutoencoderKL, DDPMScheduler, DiffusionPipeline, UNet2DConditionModel, StableDiffusionPipeline
 from diffusers.models.cross_attention import CrossAttention
 from mae.models_mae import mae_vit_large_patch16, mae_vit_base_patch16, mae_vit_huge_patch14
@@ -44,15 +45,20 @@ def read_metadata(meta_data_file, img_data_path, depth_data_path, view_data_path
         inst_data[inst_id]['views'].append(img_data)
     return inst_data
 
-# TODO: use white pixels (currently background supposed to be black pixels)
-def crop_image_bbox(img):
-    #img = np.array(img)
-    foreground = img.sum(axis=-1) < 765
-
-    idxs = np.argwhere(foreground)
+def adjust_image_bbox(mask):
+    mask = mask.numpy()
+    idxs = np.argwhere(mask == 1)
+    wh = np.array(mask.shape, dtype=float)
     min_xy, max_xy = idxs.min(axis=0), idxs.max(axis=0)
-    img = img[min_xy[0]:max_xy[0]+1, min_xy[1]:max_xy[1]+1]
-    return Image.fromarray(img)
+    ctr_xy, ext_xy = (min_xy+max_xy)/2, (max_xy-min_xy+1)/wh
+    scale = ext_xy.max()
+    ext_xy = scale * wh / 2
+    min_xy, max_xy = np.maximum(ctr_xy - ext_xy, 0), np.minimum(ctr_xy + ext_xy + 1, wh) 
+
+    return (min_xy, max_xy), (wh*(1-scale), wh*scale)
+
+def crop_image(img, min_xy, max_xy):
+    return img[..., int(min_xy[0]):int(max_xy[0]), int(min_xy[1]):int(max_xy[1])]
 
 # See dreambooth train_dreambooth.py
 class MultiViewDataset(Dataset):
@@ -88,17 +94,31 @@ class MultiViewDataset(Dataset):
         inst_id = index % self.num_instances
         inst_data = self.inst_data[inst_id]
 
+        # depth + mask
+        depth = torch.Tensor(np.load(inst_data['depth'])).squeeze(0)
+        mask = torch.Tensor(np.load(inst_data['mask'])).bool()
+
         # crop
-        # images = [crop_image_bbox(image) for image in images] # crop images
+        #images = [crop_image_bbox(image) for image in images] # crop images
         # image
+
+
+        center_crop, crop_only = adjust_image_bbox(mask)
+
         image = Image.open(inst_data['image']).convert("RGB")
         image = torch.Tensor(np.array(image)).unsqueeze(0).permute((0,3,1,2))/255
+        image[:, :, mask==0] = 1 # mask in white
+        image = crop_image(image, *center_crop) # center and crop 
         image = F.interpolate(image, size=self.size, mode='bilinear').squeeze(0)
-        image = 2*(image-1)
+        image = 2*image.contiguous()-1
 
-        # depth
-        depth = torch.Tensor(np.load(inst_data['depth']))
+        depth[mask==0] = 0 
+        depth = crop_image(depth, *center_crop) # center and crop 
+        depth = F.interpolate(depth.view(1,1,*depth.shape), size=self.size, mode='bilinear').squeeze()
 
+        mask = crop_image(mask, *center_crop) # center and crop 
+        mask = F.interpolate(mask.view(1,1,*mask.shape).float(), size=self.size, mode='bilinear').squeeze()
+        mask = mask > 0
         # views
         views_id = list(range(len(inst_data['views'])))
         # sample views
@@ -109,11 +129,12 @@ class MultiViewDataset(Dataset):
         # got OOM errors when using torchvision.transforms
         views_images = [np.load(view['image']) for view in views_data]
         views_images = torch.Tensor(np.array(views_images)).permute((0,3,1,2))/255 
-        views_images = F.interpolate(views_images, size=self.context_size, mode='bilinear')
-        views_images = 2*(views_images-1).contiguous()
+        #views_images = crop_image(views_images, *crop_only) # center and crop 
+        views_images = F.interpolate(views_images, size=self.context_size, mode='bilinear') 
+        #views_images = 2*views_images.contiguous()-1
 
         # TODO: add positional encoding for viewpoints (MAE)
-        return {'image': image, 'depth': depth, 'views': views_images, 'viewpoints': views_vp}
+        return {'image': image, 'depth': depth, 'mask': mask, 'views': views_images, 'viewpoints': views_vp}
     
 # TODO: add fp16
 # See facebook MAE 
@@ -177,7 +198,8 @@ class MultiViewDiffusionModel(nn.Module):
         self.noise_scheduler = DDPMScheduler.from_pretrained(opts.sd_model, subfolder="scheduler")
         self.multiview_encoder = MultiViewEncoder(args)
         self.vae = self.pipe.vae
-        self.unet = self.pipe.unet
+        self.unet = UNet2DConditionModel.from_pretrained(opts.sd_model, subfolder="unet")
+        self.unet_uncond = UNet2DConditionModel.from_pretrained(opts.sd_model, subfolder="unet")
         self.train_multiview_encoder = opts.train_multiview_encoder
         self.with_prior_preservation = opts.with_prior_preservation
         self.prior_loss_weight = opts.prior_loss_weight if self.with_prior_preservation else None
@@ -191,8 +213,9 @@ class MultiViewDiffusionModel(nn.Module):
                         layer.reset_parameters()
         self.unet.apply(reset_crossattention_params)
 
+        self.patch_sd_unet()
         # https://huggingface.co/docs/diffusers/optimization/fp16
-        self.pipe.enable_vae_slicing()
+        self.vae.enable_slicing()
 
     def finetunable_parameters(self):
         return itertools.chain(self.unet.parameters(), self.multiview_encoder.parameters()) if self.train_multiview_encoder else self.unet.parameters()
@@ -269,19 +292,47 @@ class MultiViewDiffusionModel(nn.Module):
     # https://github.com/AttendAndExcite/Attend-and-Excite/blob/main/notebooks/explain.ipynb
     def forward_with_crossattention(self, batch, res=16):
         controller = AttentionStore()
-        cross_att_count = register_attention_control(self.pipe, controller)
+        cross_att_count = register_attention_control(self.unet, controller)
         result = self.forward(batch)
         attention_maps = aggregate_attention(attention_store=controller, res=res, from_where=("up", "down", "mid"), is_cross=True, select=0)
-        cross_att_count2 = register_attention_control(self.pipe, controller, unregister=True)
+        cross_att_count2 = register_attention_control(self.unet, controller, unregister=True)
         assert(cross_att_count == cross_att_count2)
         return result, attention_maps
 
-    #def patch_sd_unet(latent, t, t, encoder_hidden_states, cross_attention_kwargs):
-    #    return self.
+    def patch_sd_unet(self):
+        old_encode_prompt = self.pipe._encode_prompt
+        def new_encode_prompt(prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt=None, prompt_embeds=None, negative_prompt_embeds=None):
+            assert(prompt is None and prompt_embeds is not None and negative_prompt is None and negative_prompt_embeds is None)
+            batch_size = prompt_embeds.shape[0]
+            uncond_prompt =  [""] * batch_size
+            hidden_uncond = old_encode_prompt(uncond_prompt, device, num_images_per_prompt, do_classifier_free_guidance=False) if do_classifier_free_guidance else None
+            hidden_cond   = old_encode_prompt(None, device, num_images_per_prompt, do_classifier_free_guidance=False, prompt_embeds=prompt_embeds)
+            return SimpleNamespace(dtype=hidden_cond.dtype, uncond=hidden_uncond, cond=hidden_cond, do_classifier_free_guidance=do_classifier_free_guidance)
+
+        def new_unet_forward(sample, timestep, encoder_hidden_states, *args, **kwargs):
+            do_classifier_free_guidance = encoder_hidden_states.do_classifier_free_guidance
+
+            if do_classifier_free_guidance:
+                sample_uncond, sample_cond = sample.chunk(2)
+                hidden_uncond, hidden_cond = encoder_hidden_states.uncond, encoder_hidden_states.cond
+                
+                sample = torch.cat([
+                    self.unet_uncond(sample_uncond, timestep, hidden_uncond, *args, **kwargs).sample, 
+                    self.unet(sample_cond, timestep, hidden_cond, *args, **kwargs).sample
+                ], axis=0)
+                return SimpleNamespace(sample=sample)
+            else:
+                # cond only  
+                return self.unet(sample, timestep, encoder_hidden_states.cond,   *args, **kwargs)
+        # no self passed to monkey-patched methods
+        # https://stackoverflow.com/questions/28127874/monkey-patching-python-an-instance-method
+        self.pipe._encode_prompt = new_encode_prompt
+        self.pipe.unet.forward = new_unet_forward
 
     # see https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion.py
     #TODO: fix unconditional guidance
     def forward(self, batch):
         with torch.inference_mode():
             batch = self.multiview_encoder(batch)
-            return self.pipe(prompt=None, prompt_embeds=batch['context'], do_classifier_free_guidance=True).images
+            self.pipe.to(batch['context'].device)
+            return self.pipe(prompt=None, prompt_embeds=batch['context']).images

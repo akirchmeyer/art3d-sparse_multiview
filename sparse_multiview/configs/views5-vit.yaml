@@ -53,7 +53,6 @@ dataset:
   val_subsample_inst_size: 10
   resolution: 512
   context_resolution: 224
-  num_views_per_inst: 5
   img_data_path: "/grogu/user/akirchme/art3d_sd_webui/fg/horse"
   depth_data_path: "/grogu/user/akirchme/art3d_sd_webui/depth/horse"
   view_data_path: "/grogu/user/akirchme/art3d_sd_webui/multiview_new/horse/novel_view_rgb"

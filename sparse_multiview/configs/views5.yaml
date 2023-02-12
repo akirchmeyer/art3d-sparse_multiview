@@ -31,7 +31,6 @@ optimizer:
   adam_weight_decay: 1e-2
   adam_epsilon: 1e-08
 
-
 diffusion:
   sd_model: "stabilityai/stable-diffusion-2-1-base"
   train_multiview_encoder: False
@@ -42,6 +41,8 @@ multiview_encoder:
   model_name: 'mae'
   model_size: 'large'
   view_mask_ratio: 0.75
+  dropout: 0.2
+  cross_attention_dim: 1024
 
   mae:
     model_checkpoint_path: "/grogu/user/akirchme/pretrained/mae"
@@ -49,15 +50,14 @@ multiview_encoder:
     image_mask_ratio: 0.75
 
 dataset:
-  train_subsample_inst_size: -1
-  val_subsample_inst_size: 10
+  train_subsample_inst_size: 1
+  val_subsample_inst_size: 1
   resolution: 512
   context_resolution: 224
-  num_views_per_inst: 5
   img_data_path: "/grogu/user/akirchme/art3d_sd_webui/fg/horse"
   depth_data_path: "/grogu/user/akirchme/art3d_sd_webui/depth/horse"
   view_data_path: "/grogu/user/akirchme/art3d_sd_webui/multiview_new/horse/novel_view_rgb"
   mask_data_path: "/grogu/user/akirchme/art3d_sd_webui/masks/horse"
-  meta_data_file: "/grogu/user/akirchme/art3d_sd_webui/metadata_new/horse/multiview.csv"
+  meta_data_file: "/grogu/user/akirchme/art3d_sd_webui/metadata_new/horse/multiview_0_300.csv"
   center_crop: False
   random_flip: False
