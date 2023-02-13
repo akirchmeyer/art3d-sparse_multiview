@@ -232,7 +232,7 @@ class MultiViewDiffusionModel(nn.Module):
                 if type(layer) != ResidualCrossAttention:
                     patch_crossattention(layer, name, verbose)
 
-        patch_crossattention(self.unet, "unet", verbose=False)
+        patch_crossattention(self.unet, "unet", verbose=True)
 
         # https://huggingface.co/docs/diffusers/optimization/fp16
         self.vae.enable_slicing()
@@ -244,7 +244,6 @@ class MultiViewDiffusionModel(nn.Module):
         self.vae.requires_grad_(False)
 
         for name, params in self.unet.named_parameters():
-            #params.requires_grad = 'transformer_blocks' in name and 'multiview_cross' in name and ('attn2.to_k' in name or 'attn2.to_v' in name or 'attn2.to_q' in name or 'attn2.to_out' in name)
             params.requires_grad = 'transformer_blocks' in name and 'attn2' in name and 'multiview_cross' in name
 
         if not self.train_multiview_encoder:
@@ -320,10 +319,10 @@ class MultiViewDiffusionModel(nn.Module):
     # https://github.com/AttendAndExcite/Attend-and-Excite/blob/main/run.py
     # https://github.com/AttendAndExcite/Attend-and-Excite/blob/main/pipeline_attend_and_excite.py
     # https://github.com/AttendAndExcite/Attend-and-Excite/blob/main/notebooks/explain.ipynb
-    def forward_with_crossattention(self, batch, res=16):
+    def forward_with_crossattention(self, batch, noise=None, res=16):
         controller = AttentionStore()
         cross_att_count = register_attention_control(self.unet, controller)
-        result = self.forward(batch)
+        result = self.forward(batch, noise)
         attention_maps = aggregate_attention(attention_store=controller, res=res, from_where=("up", "down", "mid"), is_cross=True, select=0)
         cross_att_count2 = register_attention_control(self.unet, controller, unregister=True)
         assert(cross_att_count == cross_att_count2)
@@ -331,8 +330,8 @@ class MultiViewDiffusionModel(nn.Module):
 
     # see https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion.py
     #TODO: fix unconditional guidance
-    def forward(self, batch):
+    def forward(self, batch, latents=None):
         with torch.inference_mode():
             batch = self.multiview_encoder(batch)
             self.pipe.to(batch['source'].device) 
-            return self.pipe(prompt=batch['class'], cross_attention_kwargs=dict(multiview_hidden_states=batch['source'])).images[0]
+            return self.pipe(latents=latents, prompt=batch['class'], cross_attention_kwargs=dict(multiview_hidden_states=batch['source'])).images[0]

@@ -1,14 +1,14 @@
 trainer:
   mode: 'train'
-  output_dir: "/grogu/user/akirchme/multiview/checkpoints/views5-1"
+  output_dir: "/grogu/user/akirchme/multiview/checkpoints/views5-mae"
   logging_dir: 'logs'
   mixed_precision: "no"
   use_8bit_adam: True
   train_batch_size: 4
   total_batch_size: 4
   gradient_accumulation_steps: 1
-  num_train_epochs: 1000
-  checkpointing_epochs: 100
+  num_train_epochs: 100
+  checkpointing_epochs: 10
   resume_from_checkpoint: 'latest'
   set_grads_to_none: True
   enable_xformers_memory_efficient_attention: False
@@ -16,6 +16,8 @@ trainer:
   seed: null
   dataloader_num_workers: 8
   max_grad_norm: 1.0
+  num_eval: 3
+  num_noises: 3
 
 
 
@@ -54,8 +56,7 @@ dataset:
   val_subsample_inst_size: 1
   resolution: 512
   context_resolution: 224
-  num_images: 100
-  num_vis: 10
+  num_images: 1000
   img_data_path: "/grogu/user/akirchme/art3d_sd_webui/fg/dog"
   depth_data_path: "/grogu/user/akirchme/art3d_sd_webui/depth/dog"
   view_data_path: "/grogu/user/akirchme/art3d_sd_webui/multiview_new/dog/novel_view_rgb"

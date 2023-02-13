@@ -45,6 +45,7 @@ from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version
 from diffusers.utils.import_utils import is_xformers_available
 from omegaconf import OmegaConf
+import numpy as np
 
 from multiview import MultiViewDiffusionModel, MultiViewEncoder, MultiViewDataset
 import wandb
@@ -98,12 +99,16 @@ def evaluate(args, accelerator, model, dataloader, epoch, noises):
     progress_bar.set_description(f'Eval [{epoch}]')
 
     total_loss = 0
-    imgs, cross_maps = [], []
+    imgs, cross_maps = [[] for noise in noises], []
     for step, batch in enumerate(dataloader):
+        if step >= opts_trainer.num_eval:
+            break
         with accelerator.accumulate(model):
             loss = model.compute_loss(batch)
-            img, cross = model.forward_with_crossattention(batch)
-            imgs.append(img.permute(1,2,0).cpu().numpy())
+            for i, noise in enumerate(noises):
+                noise = noise.unsqueeze(0)
+                img, cross = model.forward_with_crossattention(batch, noise=noise)
+                imgs[i].append(np.array(img))
             cross_maps.append(cross.cpu().numpy())
             total_loss += accelerator.gather(loss.item())
         progress_bar.update(1)
@@ -111,10 +116,11 @@ def evaluate(args, accelerator, model, dataloader, epoch, noises):
             "eval_loss": total_loss / ((step+1)*accelerator.num_processes), 
         }
         progress_bar.set_postfix(**logs)
-    crosses = {f'cross_{i}': [wandb.Image(cross[:,:,i]) for i in range(cross.shape[-1])] for cross in cross_maps}
+    #crosses = {f'cross_{j}': [wandb.Image(cross[:,:,i]) for i in range(cross.shape[-1])] for j, cross in enumerate(cross_maps)}
+    images = {f'sample_{j}': [wandb.Image(img) for img in imgs] for j, imgs in enumerate(imgs)}
     logs.update({
-        'eval_images': [wandb.Image(img) for img in imgs],
-        **crosses
+        **images
+        #**crosses
     })
     accelerator.log(logs, step=epoch)
     
@@ -240,6 +246,7 @@ def main(args):
         num_workers=opts_trainer.dataloader_num_workers,
         #pin_memory=True
     )
+    batches = [train_dataset[i] for i in range(5)]
 
     # TODO: validation dataset
     val_dataset = MultiViewDataset(args, mode='val')
@@ -269,7 +276,10 @@ def main(args):
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
         accelerator.init_trackers("multiview_sd", config=vars(args))
-        #tracker = accelerator.get_tracker('wandb')
+        accelerator.log({f'dataset_target': [wandb.Image(batches[0]['target'].cpu())]})
+        accelerator.log({f'dataset_source': [wandb.Image(batch['source'].cpu()) for batch in batches]})
+
+        tracker = accelerator.get_tracker('wandb')
         #tracker.define_metric("step")
         #tracker.define_metric("train_loss_ep", step_metric="epoch")
         #tracker.define_metric("val_loss_ep", step_metric="epoch")
@@ -309,12 +319,14 @@ def main(args):
     # Only show the progress bar once on each machine.
     train_progress_bar = tqdm(range(first_epoch*num_update_steps_per_epoch, max_train_steps), disable=not accelerator.is_local_main_process, position=0)
 
+    noises = torch.randn((opts_trainer.num_noises, 4, 64, 64)).cuda()
     if opts_trainer.mode == 'train':
         for epoch in range(first_epoch, opts_trainer.num_train_epochs):
             train_epoch(args, accelerator, model, optimizer, lr_scheduler, train_dataloader, epoch, train_progress_bar)
-            evaluate(args, accelerator, model, val_dataloader, epoch)
-    if opts_trainer.mode == 'eval':
-        evaluate(args, accelerator, model, val_dataloader, first_epoch)
+            if accelerator.is_local_main_process:
+                evaluate(args, accelerator, model, val_dataloader, epoch, noises)
+    if opts_trainer.mode == 'eval' and accelerator.is_local_main_process:
+        evaluate(args, accelerator, model, val_dataloader, first_epoch, noises)
 
     # Create the pipeline using using the trained modules and save it.
     # TODO: save
