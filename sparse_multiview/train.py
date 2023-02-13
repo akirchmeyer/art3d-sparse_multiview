@@ -47,6 +47,7 @@ from diffusers.utils.import_utils import is_xformers_available
 from omegaconf import OmegaConf
 
 from multiview import MultiViewDiffusionModel, MultiViewEncoder, MultiViewDataset
+import wandb
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.13.0.dev0")
@@ -89,7 +90,7 @@ def train_epoch(args, accelerator, model, optimizer, lr_scheduler, train_dataloa
             accelerator.save_state(save_path)
             logger.info(f"Saved state to {save_path}")
 
-def evaluate(args, accelerator, model, dataloader, epoch):
+def evaluate(args, accelerator, model, dataloader, epoch, noises):
     opts_trainer = args.trainer
     model.eval()
 
@@ -97,14 +98,26 @@ def evaluate(args, accelerator, model, dataloader, epoch):
     progress_bar.set_description(f'Eval [{epoch}]')
 
     total_loss = 0
+    imgs, cross_maps = [], []
     for step, batch in enumerate(dataloader):
         with accelerator.accumulate(model):
             loss = model.compute_loss(batch)
+            img, cross = model.forward_with_crossattention(batch)
+            imgs.append(img.permute(1,2,0).cpu().numpy())
+            cross_maps.append(cross.cpu().numpy())
             total_loss += accelerator.gather(loss.item())
         progress_bar.update(1)
-        logs = {"eval_loss": total_loss / ((step+1)*accelerator.num_processes)}
+        logs = {
+            "eval_loss": total_loss / ((step+1)*accelerator.num_processes), 
+        }
         progress_bar.set_postfix(**logs)
+    crosses = {f'cross_{i}': [wandb.Image(cross[:,:,i]) for i in range(cross.shape[-1])] for cross in cross_maps}
+    logs.update({
+        'eval_images': [wandb.Image(img) for img in imgs],
+        **crosses
+    })
     accelerator.log(logs, step=epoch)
+    
 
 def main(args):
     opts_trainer = args.trainer

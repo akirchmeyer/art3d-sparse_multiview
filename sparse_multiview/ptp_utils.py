@@ -62,7 +62,8 @@ def register_attention_control(unet, controller, unregister=False):
             hidden_states,
             encoder_hidden_states=None,
             attention_mask=None,
-            place_in_unet=None
+            place_in_unet=None,
+            **cross_attention_kwargs
         ):
             batch_size, sequence_length, _ = hidden_states.shape
             attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
@@ -95,25 +96,25 @@ def register_attention_control(unet, controller, unregister=False):
 
             return hidden_states
 
-    def register_recr(net_, count, place_in_unet, unregister=False):
-        if net_.__class__.__name__ == 'CrossAttention':
-            if unregister:  net_.set_processor(CrossAttnProcessor())
-            else:           net_.set_processor(partial(new_processor, place_in_unet=place_in_unet))
+    def register_recr(name, net, count, place_in_unet, unregister=False):
+        if net.__class__.__name__ == 'CrossAttention' and 'multiview_cross' in name:
+            if unregister:  net.set_processor(CrossAttnProcessor())
+            else:           net.set_processor(partial(new_processor, place_in_unet=place_in_unet))
             return count + 1
-        elif hasattr(net_, 'children'):
-            for net__ in net_.children():
-                count = register_recr(net__, count, place_in_unet, unregister)
+        elif hasattr(net, 'named_children'):
+            for name_, net__ in net.named_children():
+                count = register_recr(name_, net__, count, place_in_unet, unregister)
         return count
 
     cross_att_count = 0
     sub_nets = unet.named_children()
-    for net in sub_nets:
-        if "down" in net[0]:
-            cross_att_count += register_recr(net[1], 0, "down", unregister)
-        elif "up" in net[0]:
-            cross_att_count += register_recr(net[1], 0, "up", unregister)
-        elif "mid" in net[0]:
-            cross_att_count += register_recr(net[1], 0, "mid", unregister)
+    for name, net in sub_nets:
+        if "down" in name:
+            cross_att_count += register_recr(name, net, 0, "down", unregister)
+        elif "up" in name:
+            cross_att_count += register_recr(name, net, 0, "up", unregister)
+        elif "mid" in name:
+            cross_att_count += register_recr(name, net, 0, "mid", unregister)
     controller.num_att_layers = cross_att_count
     return cross_att_count
 

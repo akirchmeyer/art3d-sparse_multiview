@@ -17,7 +17,7 @@ import timm
 from ptp_utils import AttentionStore, aggregate_attention, register_attention_control
 from PIL import Image
 
-def read_metadata(meta_data_file, img_data_path, depth_data_path, view_data_path, mask_data_path, subsample_inst_size):
+def read_metadata(cls, meta_data_file, img_data_path, depth_data_path, view_data_path, mask_data_path, subsample_inst_size):
     meta_df = pd.read_csv(meta_data_file, dtype={'index': str})
     inst_ids = {}
     inst_data = []
@@ -32,6 +32,7 @@ def read_metadata(meta_data_file, img_data_path, depth_data_path, view_data_path
                     'mask': f'{mask_data_path}/{inst}.npy', 
                     'image':f'{img_data_path}/{inst}.png', 
                     'depth':f'{depth_data_path}/{inst}.npy', 
+                    'class':cls,
                     'views':[],
                 })
             else:
@@ -42,23 +43,23 @@ def read_metadata(meta_data_file, img_data_path, depth_data_path, view_data_path
             'elev':row['elev'], 
             'azim':row['azim']
         }
+        # TODO: filtering -20, 20
+        #if np.abs(img_data['elev']) <= 30 and np.abs(img_data['azim']) <= 30:
         inst_data[inst_id]['views'].append(img_data)
     return inst_data
 
+print('Keeping only azim and elev in [-20,20]')
+
 def adjust_image_bbox(mask):
     mask = mask.numpy()
-    idxs = np.argwhere(mask == 1)
-    wh = np.array(mask.shape, dtype=float)
+    idxs = np.argwhere(mask)
     min_xy, max_xy = idxs.min(axis=0), idxs.max(axis=0)
-    ctr_xy, ext_xy = (min_xy+max_xy)/2, (max_xy-min_xy+1)/wh
-    scale = ext_xy.max()
-    ext_xy = scale * wh / 2
-    min_xy, max_xy = np.maximum(ctr_xy - ext_xy, 0), np.minimum(ctr_xy + ext_xy + 1, wh) 
+    ext_xy = max_xy - min_xy
+    pad_xy = (ext_xy.max() - ext_xy[0], ext_xy.max() - ext_xy[1])
+    return (min_xy, max_xy, pad_xy)
 
-    return (min_xy, max_xy), (wh*(1-scale), wh*scale)
-
-def crop_image(img, min_xy, max_xy):
-    return img[..., int(min_xy[0]):int(max_xy[0]), int(min_xy[1]):int(max_xy[1])]
+def crop_image(img, min_xy, max_xy, pad_xy):
+    return F.pad(img[..., int(min_xy[0]):int(max_xy[0]), int(min_xy[1]):int(max_xy[1])], (pad_xy[1]//2, pad_xy[1]//2, pad_xy[0]//2, pad_xy[0]//2), "constant", 1,)
 
 # See dreambooth train_dreambooth.py
 class MultiViewDataset(Dataset):
@@ -83,59 +84,75 @@ class MultiViewDataset(Dataset):
             raise ValueError(f"Instance {opts.mask_data_path} meta data file doesn't exist.")
 
         # load data
-        self.inst_data = read_metadata(opts.meta_data_file, opts.img_data_path, opts.depth_data_path, opts.view_data_path, opts.mask_data_path, self.subsample_inst_size)
-        self.num_views_per_inst = opts.num_views_per_inst
+        self.inst_data = read_metadata(opts.cls, opts.meta_data_file, opts.img_data_path, opts.depth_data_path, opts.view_data_path, opts.mask_data_path, self.subsample_inst_size)
         self.num_instances = len(self.inst_data)
+        self.num_images = opts.num_images
 
     def __len__(self):
-        return self.num_instances
+        return self.num_images
 
     def __getitem__(self, index):
         inst_id = index % self.num_instances
         inst_data = self.inst_data[inst_id]
 
+        cls = inst_data['class']
+
+        target_image = Image.open(inst_data['image']).convert("RGB")
+        target_image = torch.Tensor(np.array(target_image)).unsqueeze(0).permute((0,3,1,2))/255
+
         # depth + mask
-        depth = torch.Tensor(np.load(inst_data['depth'])).squeeze(0)
         mask = torch.Tensor(np.load(inst_data['mask'])).bool()
+        center_crop = adjust_image_bbox(mask)
+        target_image[:, :, mask==0] = 1 # mask in white
+        target_image = crop_image(target_image, *center_crop) # center and crop 
+        target_image = F.interpolate(target_image, size=self.size, mode='bilinear').squeeze(0)
+        target_image = 2*target_image.contiguous()-1
 
-        # crop
-        #images = [crop_image_bbox(image) for image in images] # crop images
-        # image
-
-
-        center_crop, crop_only = adjust_image_bbox(mask)
-
-        image = Image.open(inst_data['image']).convert("RGB")
-        image = torch.Tensor(np.array(image)).unsqueeze(0).permute((0,3,1,2))/255
-        image[:, :, mask==0] = 1 # mask in white
-        image = crop_image(image, *center_crop) # center and crop 
-        image = F.interpolate(image, size=self.size, mode='bilinear').squeeze(0)
-        image = 2*image.contiguous()-1
-
-        depth[mask==0] = 0 
-        depth = crop_image(depth, *center_crop) # center and crop 
-        depth = F.interpolate(depth.view(1,1,*depth.shape), size=self.size, mode='bilinear').squeeze()
-
-        mask = crop_image(mask, *center_crop) # center and crop 
-        mask = F.interpolate(mask.view(1,1,*mask.shape).float(), size=self.size, mode='bilinear').squeeze()
-        mask = mask > 0
         # views
-        views_id = list(range(len(inst_data['views'])))
+        view_id = list(range(len(inst_data['views'])))
         # sample views
-        views_id = np.random.choice(views_id, size=self.num_views_per_inst, replace=False) # TODO: replace=True? mask?
-        views_data = [inst_data['views'][i] for i in views_id]
-        
-        views_vp = torch.stack([torch.Tensor([view['elev'], view['azim']]) for view in views_data])
+        view_id = np.random.choice(view_id, size=1, replace=False)[0] # TODO: replace=True? mask?
+        source_data = inst_data['views'][view_id]
+        source_vp = torch.Tensor([source_data['elev'], source_data['azim']])
+
         # got OOM errors when using torchvision.transforms
-        views_images = [np.load(view['image']) for view in views_data]
-        views_images = torch.Tensor(np.array(views_images)).permute((0,3,1,2))/255 
-        #views_images = crop_image(views_images, *crop_only) # center and crop 
-        views_images = F.interpolate(views_images, size=self.context_size, mode='bilinear') 
-        #views_images = 2*views_images.contiguous()-1
+        source_image = torch.Tensor(np.load(source_data['image'])).unsqueeze(0).permute((0,3,1,2))/255 
+        mask = source_image[0,:,:,:].mean(axis=0)
+        center_crop = adjust_image_bbox(mask < 1)
+        source_image = crop_image(source_image, *center_crop) # center and crop 
+        source_image = F.interpolate(source_image, size=self.context_size, mode='bilinear')
+        source_image = 2*source_image.contiguous()-1
 
         # TODO: add positional encoding for viewpoints (MAE)
-        return {'image': image, 'depth': depth, 'mask': mask, 'views': views_images, 'viewpoints': views_vp}
-    
+        return {'target': target_image, 'source': source_image, 'pose': source_vp, 'class': cls}
+
+class ResidualCrossAttention(nn.Module):
+    def __init__(self, args, text_cross):
+        super().__init__()
+        self.text_cross = text_cross
+        dropout = args.multiview_encoder.dropout
+        cross_attention_dim = args.multiview_encoder.cross_attention_dim #TODO: add to params
+
+        self.multiview_cross = CrossAttention(
+            query_dim = text_cross.to_q.in_features,
+            cross_attention_dim = cross_attention_dim,
+            heads = text_cross.heads,
+            dim_head = text_cross.to_q.out_features // text_cross.heads,
+            dropout = dropout,
+            bias = text_cross.to_q.bias,
+            upcast_attention = text_cross.upcast_attention,
+            upcast_softmax = text_cross.upcast_softmax,
+            cross_attention_norm = text_cross.cross_attention_norm, 
+            added_kv_proj_dim = None,
+            norm_num_groups = None,
+            processor = None,
+        )
+
+    def forward(self, x, encoder_hidden_states=None, attention_mask=None, multiview_hidden_states=None, **cross_attention_kwargs):
+        x = self.text_cross(x, encoder_hidden_states=encoder_hidden_states, attention_mask=attention_mask, **cross_attention_kwargs)
+        do_classifier_free_guidance = len(encoder_hidden_states) == 2
+        return x + self.multiview_cross(x, encoder_hidden_states=torch.cat(2*[multiview_hidden_states]) if do_classifier_free_guidance else multiview_hidden_states, attention_mask=attention_mask, **cross_attention_kwargs)
+
 # TODO: add fp16
 # See facebook MAE 
 # See timm ViT
@@ -146,7 +163,7 @@ class MultiViewEncoder(nn.Module):
         self.model_name = opts.model_name
         match opts.model_name:
             case 'mae':
-                self.encode_context = self.mae_encode_context
+                self.encode_source = self.mae_encode_source
                 self.mae_image_mask_ratio = opts.mae.image_mask_ratio
                 match opts.model_size:
                     case 'base': self.model = mae_vit_base_patch16(checkpoint=opts.mae.model_checkpoint_path, norm_pix_loss=False)
@@ -154,7 +171,7 @@ class MultiViewEncoder(nn.Module):
                     case 'huge': self.model = mae_vit_huge_patch14(checkpoint=opts.mae.model_checkpoint_path, norm_pix_loss=False)
                     case _: raise "Unrecognized MAE model size"
             case 'vit':
-                self.encode_context = self.vit_encode_context
+                self.encode_source = self.vit_encode_source
                 match opts.model_size:
                     case 'base': self.model = timm.create_model('vit_base_patch16_224', pretrained=True)
                     case 'large': self.model = timm.create_model('vit_large_patch16_224', pretrained=True)
@@ -165,26 +182,24 @@ class MultiViewEncoder(nn.Module):
         # TODO: view mask ratio --> need viewpoint PE
         self.view_mask_ratio = opts.view_mask_ratio
 
-    def mae_encode_context(self, context):
+    def mae_encode_source(self, context):
         #_, image, _ = self.mae(image, mask_ratio=self.image_mask_ratio)
         context, _, _ = self.model.forward_encoder(context.view(-1, *context.shape[2:]), mask_ratio=self.mae_image_mask_ratio)
         return context
 
-    def vit_encode_context(self, context):
+    def vit_encode_source(self, context):
         context = self.model.forward_features(context.view(-1, *context.shape[2:]))
         return context
 
     def forward(self, input):
         # x: (N, C, H, W), views: (N, V, C, H, W) , V = n_views_per_inst
-        image, context = input['image'], input['views']
+        source = input['source']
         # TODO: add reconstruction loss from MAE?
         # TODO: MAE only accepts 224x224
-        bsz = context.shape[0]
-        # context: (bsz, num_views_per_inst, num_patches, hidden)
-        context = self.encode_context(context)
-        # context: (bsz, num_views_per_inst*num_patches, hidden)
-        context = context.view(bsz, -1, context.shape[-1])
-        return {'image': image, 'context': context}
+        bsz = source.shape[0]
+        source = self.encode_source(source) # (bsz, num_views_per_inst, num_patches, hidden)
+        source = source.view(bsz, -1, source.shape[-1]) # (bsz, num_views_per_inst*num_patches, hidden)
+        return {'target': input['target'], 'source': source, 'class': input['class'], 'pose': input['pose']}
 
 from diffusers import AutoencoderKL, DDPMScheduler, DiffusionPipeline, UNet2DConditionModel
 
@@ -198,22 +213,27 @@ class MultiViewDiffusionModel(nn.Module):
         self.noise_scheduler = DDPMScheduler.from_pretrained(opts.sd_model, subfolder="scheduler")
         self.multiview_encoder = MultiViewEncoder(args)
         self.vae = self.pipe.vae
-        self.unet = UNet2DConditionModel.from_pretrained(opts.sd_model, subfolder="unet")
-        self.unet_uncond = UNet2DConditionModel.from_pretrained(opts.sd_model, subfolder="unet")
+        self.unet = self.pipe.unet
         self.train_multiview_encoder = opts.train_multiview_encoder
         self.with_prior_preservation = opts.with_prior_preservation
         self.prior_loss_weight = opts.prior_loss_weight if self.with_prior_preservation else None
 
         # reset unet crossattention params
-        @torch.no_grad()
-        def reset_crossattention_params(model):
-            if model.__class__.__name__ == 'CrossAttention':
-                for layer in model.children():
-                    if hasattr(layer, 'reset_parameters'):
-                        layer.reset_parameters()
-        self.unet.apply(reset_crossattention_params)
+        # https://discuss.pytorch.org/t/replacing-convs-modules-with-custom-convs-then-notimplementederror/17736
+        def patch_crossattention(model, name, verbose=False):
+            for attr in dir(model):
+                target_attr = getattr(model, attr)
+                if type(target_attr) == CrossAttention and attr == 'attn2':
+                    if verbose: print(f'replaced: layer={name} attr={attr}')
+                    setattr(model, attr, ResidualCrossAttention(args, target_attr))
+                #if type(target_attr) == XFormersCrossAttnProcessor:
+                #    target_attr.__call__ = lambda 
+            for name, layer in model.named_children():
+                if type(layer) != ResidualCrossAttention:
+                    patch_crossattention(layer, name, verbose)
 
-        self.patch_sd_unet()
+        patch_crossattention(self.unet, "unet", verbose=False)
+
         # https://huggingface.co/docs/diffusers/optimization/fp16
         self.vae.enable_slicing()
 
@@ -224,7 +244,8 @@ class MultiViewDiffusionModel(nn.Module):
         self.vae.requires_grad_(False)
 
         for name, params in self.unet.named_parameters():
-            params.requires_grad = 'transformer_blocks' in name and ('attn2.to_k' in name or 'attn2.to_v' in name)
+            #params.requires_grad = 'transformer_blocks' in name and 'multiview_cross' in name and ('attn2.to_k' in name or 'attn2.to_v' in name or 'attn2.to_q' in name or 'attn2.to_out' in name)
+            params.requires_grad = 'transformer_blocks' in name and 'attn2' in name and 'multiview_cross' in name
 
         if not self.train_multiview_encoder:
             self.multiview_encoder.requires_grad_(False)
@@ -245,9 +266,10 @@ class MultiViewDiffusionModel(nn.Module):
     def compute_loss(self, batch):
         # Get the text embedding for conditioning
         batch = self.multiview_encoder(batch)
+        self.pipe.to(batch['source'].device)
 
         # Convert images to latent space
-        latents = self.vae.encode(batch["image"]).latent_dist.sample()
+        latents = self.vae.encode(batch["target"]).latent_dist.sample()
         latents = latents * self.vae.config.scaling_factor
 
         # Sample noise that we'll add to the latents
@@ -261,8 +283,16 @@ class MultiViewDiffusionModel(nn.Module):
         # (this is the forward diffusion process)
         noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
 
-        # Predict the noise residual
-        model_pred = self.unet(noisy_latents, timesteps, batch['context']).sample
+        input_ids = self.pipe.tokenizer(
+            batch['class'],
+            truncation=True,
+            padding="max_length",
+            max_length=self.pipe.tokenizer.model_max_length,
+            return_tensors="pt",
+        ).input_ids.to(batch['source'].device)
+
+        text_states = self.pipe.text_encoder(input_ids)[0]
+        model_pred = self.unet(noisy_latents, timesteps, text_states, cross_attention_kwargs=dict(multiview_hidden_states=batch['source'])).sample
 
         # Get the target for loss depending on the prediction type
         if self.noise_scheduler.config.prediction_type == "epsilon":
@@ -299,40 +329,10 @@ class MultiViewDiffusionModel(nn.Module):
         assert(cross_att_count == cross_att_count2)
         return result, attention_maps
 
-    def patch_sd_unet(self):
-        old_encode_prompt = self.pipe._encode_prompt
-        def new_encode_prompt(prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt=None, prompt_embeds=None, negative_prompt_embeds=None):
-            assert(prompt is None and prompt_embeds is not None and negative_prompt is None and negative_prompt_embeds is None)
-            batch_size = prompt_embeds.shape[0]
-            uncond_prompt =  [""] * batch_size
-            hidden_uncond = old_encode_prompt(uncond_prompt, device, num_images_per_prompt, do_classifier_free_guidance=False) if do_classifier_free_guidance else None
-            hidden_cond   = old_encode_prompt(None, device, num_images_per_prompt, do_classifier_free_guidance=False, prompt_embeds=prompt_embeds)
-            return SimpleNamespace(dtype=hidden_cond.dtype, uncond=hidden_uncond, cond=hidden_cond, do_classifier_free_guidance=do_classifier_free_guidance)
-
-        def new_unet_forward(sample, timestep, encoder_hidden_states, *args, **kwargs):
-            do_classifier_free_guidance = encoder_hidden_states.do_classifier_free_guidance
-
-            if do_classifier_free_guidance:
-                sample_uncond, sample_cond = sample.chunk(2)
-                hidden_uncond, hidden_cond = encoder_hidden_states.uncond, encoder_hidden_states.cond
-                
-                sample = torch.cat([
-                    self.unet_uncond(sample_uncond, timestep, hidden_uncond, *args, **kwargs).sample, 
-                    self.unet(sample_cond, timestep, hidden_cond, *args, **kwargs).sample
-                ], axis=0)
-                return SimpleNamespace(sample=sample)
-            else:
-                # cond only  
-                return self.unet(sample, timestep, encoder_hidden_states.cond,   *args, **kwargs)
-        # no self passed to monkey-patched methods
-        # https://stackoverflow.com/questions/28127874/monkey-patching-python-an-instance-method
-        self.pipe._encode_prompt = new_encode_prompt
-        self.pipe.unet.forward = new_unet_forward
-
     # see https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion.py
     #TODO: fix unconditional guidance
     def forward(self, batch):
         with torch.inference_mode():
             batch = self.multiview_encoder(batch)
-            self.pipe.to(batch['context'].device)
-            return self.pipe(prompt=None, prompt_embeds=batch['context']).images
+            self.pipe.to(batch['source'].device) 
+            return self.pipe(prompt=batch['class'], cross_attention_kwargs=dict(multiview_hidden_states=batch['source'])).images[0]

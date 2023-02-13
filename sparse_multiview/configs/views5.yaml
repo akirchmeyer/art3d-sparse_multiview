@@ -1,6 +1,6 @@
 trainer:
   mode: 'train'
-  output_dir: "/grogu/user/akirchme/multiview/checkpoints/views5"
+  output_dir: "/grogu/user/akirchme/multiview/checkpoints/views5-1"
   logging_dir: 'logs'
   mixed_precision: "no"
   use_8bit_adam: True
@@ -11,7 +11,7 @@ trainer:
   checkpointing_epochs: 100
   resume_from_checkpoint: 'latest'
   set_grads_to_none: True
-  enable_xformers_memory_efficient_attention: True
+  enable_xformers_memory_efficient_attention: False
   gradient_checkpointing: False
   seed: null
   dataloader_num_workers: 8
@@ -54,10 +54,13 @@ dataset:
   val_subsample_inst_size: 1
   resolution: 512
   context_resolution: 224
-  img_data_path: "/grogu/user/akirchme/art3d_sd_webui/fg/horse"
-  depth_data_path: "/grogu/user/akirchme/art3d_sd_webui/depth/horse"
-  view_data_path: "/grogu/user/akirchme/art3d_sd_webui/multiview_new/horse/novel_view_rgb"
-  mask_data_path: "/grogu/user/akirchme/art3d_sd_webui/masks/horse"
-  meta_data_file: "/grogu/user/akirchme/art3d_sd_webui/metadata_new/horse/multiview_0_300.csv"
+  num_images: 100
+  num_vis: 10
+  img_data_path: "/grogu/user/akirchme/art3d_sd_webui/fg/dog"
+  depth_data_path: "/grogu/user/akirchme/art3d_sd_webui/depth/dog"
+  view_data_path: "/grogu/user/akirchme/art3d_sd_webui/multiview_new/dog/novel_view_rgb"
+  mask_data_path: "/grogu/user/akirchme/art3d_sd_webui/masks/dog"
+  meta_data_file: "/grogu/user/akirchme/art3d_sd_webui/metadata_new/dog/multiview_0_300.csv"
   center_crop: False
   random_flip: False
+  cls: 'dog'
