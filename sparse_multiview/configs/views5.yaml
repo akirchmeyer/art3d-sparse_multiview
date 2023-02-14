@@ -5,9 +5,9 @@ trainer:
   mixed_precision: "no"
   use_8bit_adam: True
   train_batch_size: 4
-  total_batch_size: 4
-  gradient_accumulation_steps: 1
-  num_train_epochs: 100
+  total_batch_size: 8
+  gradient_accumulation_steps: 2
+  num_train_epochs: 50
   checkpointing_epochs: 10
   resume_from_checkpoint: 'latest'
   set_grads_to_none: True
@@ -17,7 +17,8 @@ trainer:
   dataloader_num_workers: 8
   max_grad_norm: 1.0
   num_eval: 3
-  num_noises: 3
+  num_latents: 3
+  res: 16
 
 
 
@@ -45,6 +46,7 @@ multiview_encoder:
   view_mask_ratio: 0.75
   dropout: 0.2
   cross_attention_dim: 1024
+  pose_emb_dim: 20
 
   mae:
     model_checkpoint_path: "/grogu/user/akirchme/pretrained/mae"
@@ -52,7 +54,7 @@ multiview_encoder:
     image_mask_ratio: 0.75
 
 dataset:
-  train_subsample_inst_size: 1
+  train_subsample_inst_size: 10
   val_subsample_inst_size: 1
   resolution: 512
   context_resolution: 224

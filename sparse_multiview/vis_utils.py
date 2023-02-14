@@ -34,7 +34,7 @@ def show_cross_attention(prompt: str,
     ptp_utils.view_images(np.stack(images, axis=0))
 
 
-def show_image_relevance(image_relevance, image: Image.Image, relevnace_res=16):
+def show_image_relevance(image_relevance, image, relevnace_res=16):
     # create heatmap from mask on image
     def show_cam_on_image(img, mask):
         heatmap = cv2.applyColorMap(np.uint8(255 * mask), cv2.COLORMAP_JET)
@@ -43,9 +43,11 @@ def show_image_relevance(image_relevance, image: Image.Image, relevnace_res=16):
         cam = cam / np.max(cam)
         return cam
 
-    image = image.resize((relevnace_res ** 2, relevnace_res ** 2))
-    image = np.array(image)
-
+    if isinstance(image, Image.Image):
+        image = image.resize((relevnace_res ** 2, relevnace_res ** 2))
+        image = np.array(image)
+    else:
+        image = torch.nn.functional.interpolate(image, size=relevnace_res ** 2, mode='bilinear').squeeze().permute((1, 2, 0))
     image_relevance = image_relevance.reshape(1, 1, image_relevance.shape[-1], image_relevance.shape[-1])
     image_relevance = torch.nn.functional.interpolate(image_relevance, size=relevnace_res ** 2, mode='bilinear')
     image_relevance = (image_relevance - image_relevance.min()) / (image_relevance.max() - image_relevance.min())

@@ -44,8 +44,8 @@ def read_metadata(cls, meta_data_file, img_data_path, depth_data_path, view_data
             'azim':row['azim']
         }
         # TODO: filtering -20, 20
-        #if np.abs(img_data['elev']) <= 30 and np.abs(img_data['azim']) <= 30:
-        inst_data[inst_id]['views'].append(img_data)
+        if np.abs(img_data['elev']) <= 30 and np.abs(img_data['azim']) <= 30:
+            inst_data[inst_id]['views'].append(img_data)
     return inst_data
 
 print('Keeping only azim and elev in [-20,20]')
@@ -126,12 +126,48 @@ class MultiViewDataset(Dataset):
         # TODO: add positional encoding for viewpoints (MAE)
         return {'target': target_image, 'source': source_image, 'pose': source_vp, 'class': cls}
 
+class ViewCrossAttnProcessor:
+    def __call__(
+        self,
+        attn: CrossAttention,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        **cross_attention_kwargs
+    ):
+        batch_size, sequence_length, _ = hidden_states.shape
+        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+        query = attn.to_q(hidden_states)
+
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        elif attn.cross_attention_norm:
+            encoder_hidden_states = attn.norm_cross(encoder_hidden_states)
+
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+
+        query = attn.head_to_batch_dim(query)
+        key = attn.head_to_batch_dim(key)
+        value = attn.head_to_batch_dim(value)
+
+        attention_probs = attn.get_attention_scores(query, key, attention_mask)
+        hidden_states = torch.bmm(attention_probs, value)
+        hidden_states = attn.batch_to_head_dim(hidden_states)
+
+        # linear proj
+        hidden_states = attn.to_out[0](hidden_states)
+        # dropout
+        hidden_states = attn.to_out[1](hidden_states)
+
+        return hidden_states
+
 class ResidualCrossAttention(nn.Module):
     def __init__(self, args, text_cross):
         super().__init__()
         self.text_cross = text_cross
         dropout = args.multiview_encoder.dropout
-        cross_attention_dim = args.multiview_encoder.cross_attention_dim #TODO: add to params
+        cross_attention_dim = args.multiview_encoder.cross_attention_dim + args.multiview_encoder.pose_emb_dim #TODO: add to params
 
         self.multiview_cross = CrossAttention(
             query_dim = text_cross.to_q.in_features,
@@ -147,6 +183,10 @@ class ResidualCrossAttention(nn.Module):
             norm_num_groups = None,
             processor = None,
         )
+        #def new_prepare_attention_mask(attention_mask, target_length, batch_size=None):
+        #    assert(attention_mask is None)
+        #    return None
+        #self.multiview_cross.prepare_attention_mask = new_prepare_attention_mask
 
     def forward(self, x, encoder_hidden_states=None, attention_mask=None, multiview_hidden_states=None, **cross_attention_kwargs):
         x = self.text_cross(x, encoder_hidden_states=encoder_hidden_states, attention_mask=attention_mask, **cross_attention_kwargs)
@@ -181,6 +221,8 @@ class MultiViewEncoder(nn.Module):
 
         # TODO: view mask ratio --> need viewpoint PE
         self.view_mask_ratio = opts.view_mask_ratio
+        self.pose_emb_dim = opts.pose_emb_dim
+        self.cross_attention_dim = opts.cross_attention_dim
 
     def mae_encode_source(self, context):
         #_, image, _ = self.mae(image, mask_ratio=self.image_mask_ratio)
@@ -191,14 +233,23 @@ class MultiViewEncoder(nn.Module):
         context = self.model.forward_features(context.view(-1, *context.shape[2:]))
         return context
 
+    def encode_viewpoint(self, context, L):  # [B,...,2]
+        shape = context.shape
+        last_dim = context.shape[-1]
+        freq = 2**torch.arange(L, dtype=torch.float32, device=context.device)*np.pi  # [L]
+        spectrum = context[..., None] * freq  # [B,...,2,L]
+        points_enc= torch.cat([spectrum.sin(), spectrum.cos()], dim=-1).view(*shape[:-1], 2*last_dim*L)  # [B,...,4L]
+        return points_enc
+
     def forward(self, input):
         # x: (N, C, H, W), views: (N, V, C, H, W) , V = n_views_per_inst
         source = input['source']
         # TODO: add reconstruction loss from MAE?
         # TODO: MAE only accepts 224x224
-        bsz = source.shape[0]
-        source = self.encode_source(source) # (bsz, num_views_per_inst, num_patches, hidden)
-        source = source.view(bsz, -1, source.shape[-1]) # (bsz, num_views_per_inst*num_patches, hidden)
+        source = self.encode_source(input['source']) # (bsz, num_views_per_inst, num_patches, hidden)
+        assert(source.shape[-1] == self.cross_attention_dim) # (bsz, num_views_per_inst*num_patches, hidden)
+        pos_embed = self.encode_viewpoint(input['pose'], self.pose_emb_dim//4).unsqueeze(1)
+        source = torch.cat([source, pos_embed.repeat(1, source.shape[1], 1)], axis=-1)
         return {'target': input['target'], 'source': source, 'class': input['class'], 'pose': input['pose']}
 
 from diffusers import AutoencoderKL, DDPMScheduler, DiffusionPipeline, UNet2DConditionModel
@@ -275,6 +326,7 @@ class MultiViewDiffusionModel(nn.Module):
         noise = torch.randn_like(latents)
         bsz = latents.shape[0]
         # Sample a random timestep for each image
+        
         timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
         timesteps = timesteps.long()
 
@@ -315,23 +367,37 @@ class MultiViewDiffusionModel(nn.Module):
             loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
         return loss
 
-
     # https://github.com/AttendAndExcite/Attend-and-Excite/blob/main/run.py
     # https://github.com/AttendAndExcite/Attend-and-Excite/blob/main/pipeline_attend_and_excite.py
     # https://github.com/AttendAndExcite/Attend-and-Excite/blob/main/notebooks/explain.ipynb
-    def forward_with_crossattention(self, batch, noise=None, res=16):
+    def forward_with_crossattention(self, batch, filter_fn, res=16, avg=False, **kwargs):
         controller = AttentionStore()
         cross_att_count = register_attention_control(self.unet, controller)
-        result = self.forward(batch, noise)
-        attention_maps = aggregate_attention(attention_store=controller, res=res, from_where=("up", "down", "mid"), is_cross=True, select=0)
+        result = self.forward(batch, **kwargs)
+        attention_maps = aggregate_attention(attention_store=controller, res=res, filter_fn=filter_fn, is_cross=True, select=0, avg=avg)
         cross_att_count2 = register_attention_control(self.unet, controller, unregister=True)
         assert(cross_att_count == cross_att_count2)
         return result, attention_maps
 
     # see https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion.py
     #TODO: fix unconditional guidance
-    def forward(self, batch, latents=None):
+    def forward(self, batch, latents=None, callback_steps=0, num_inference_steps=50):
+        #intermediates = [0 for i in range(num_inference_steps)]
+
+        #def callback(i, t, latents):
+        #    if callback_steps > 0:
+        #        intermediates[i] = self.pipe.decode_latents(latents)
+
         with torch.inference_mode():
             batch = self.multiview_encoder(batch)
             self.pipe.to(batch['source'].device) 
-            return self.pipe(latents=latents, prompt=batch['class'], cross_attention_kwargs=dict(multiview_hidden_states=batch['source'])).images[0]
+            image = self.pipe(latents=latents, prompt=batch['class'], 
+                cross_attention_kwargs=dict(multiview_hidden_states=batch['source']), 
+                num_inference_steps=num_inference_steps,
+                #callback = callback if callback_steps > 0 else None, 
+                #callback_steps = callback_steps
+            ).images[0]
+        
+        #if callback_steps > 0:
+        #    return intermediates
+        return image

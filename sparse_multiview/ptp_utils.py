@@ -155,81 +155,60 @@ class AttentionControl(abc.ABC):
 
 
 class EmptyControl(AttentionControl):
-
     def forward(self, attn, is_cross: bool, place_in_unet: str):
         return attn
 
 
 class AttentionStore(AttentionControl):
-    @staticmethod
-    def get_empty_store():
-        return {"down_cross": [], "mid_cross": [], "up_cross": [],
-                "down_self": [], "mid_self": [], "up_self": []}
-
     def forward(self, attn, is_cross: bool, place_in_unet: str):
-        key = f"{place_in_unet}_{'cross' if is_cross else 'self'}"
-        if attn.shape[1] <= 32 ** 2:  # avoid memory overhead
-            self.step_store[key].append(attn)
+        key = f"{place_in_unet}_{'cross' if is_cross else 'self'}_step{self.cur_step}"
+        if key not in self.attention_store:
+            self.attention_store[key] = []
+        #if attn.shape[1] <= 32 ** 2:  # avoid memory overhead
+        self.attention_store[key].append(attn)
         return attn
 
     def between_steps(self):
-        self.attention_store = self.step_store
-        if self.save_global_store:
-            with torch.no_grad():
-                if len(self.global_store) == 0:
-                    self.global_store = self.step_store
-                else:
-                    for key in self.global_store:
-                        for i in range(len(self.global_store[key])):
-                            self.global_store[key][i] += self.step_store[key][i].detach()
-        self.step_store = self.get_empty_store()
-        self.step_store = self.get_empty_store()
+        pass
 
-    def get_average_attention(self):
+    def get_attention(self):
         average_attention = self.attention_store
-        return average_attention
-
-    def get_average_global_attention(self):
-        average_attention = {key: [item / self.cur_step for item in self.global_store[key]] for key in
-                             self.attention_store}
         return average_attention
 
     def reset(self):
         super(AttentionStore, self).reset()
-        self.step_store = self.get_empty_store()
         self.attention_store = {}
-        self.global_store = {}
 
-    def __init__(self, save_global_store=False):
+    def __init__(self):
         '''
         Initialize an empty AttentionStore
         :param step_index: used to visualize only a specific step in the diffusion process
         '''
         super().__init__()
-        self.save_global_store = save_global_store
-        self.step_store = self.get_empty_store()
         self.attention_store = {}
-        self.global_store = {}
         self.curr_step_index = 0
 
 
 def aggregate_attention(attention_store: AttentionStore,
                         res: int,
-                        from_where: List[str],
+                        filter_fn,
                         is_cross: bool,
-                        select: int) -> torch.Tensor:
+                        select: int,
+                        avg = True) -> torch.Tensor:
     """ Aggregates the attention across the different layers and heads at the specified resolution. """
     out = []
-    attention_maps = attention_store.get_average_attention()
+    attention_maps = attention_store.get_attention()
     num_pixels = res ** 2
     assert(num_pixels <= 32**2) # TODO: see AttentionStore
-    for location in from_where:
-        for item in attention_maps[f"{location}_{'cross' if is_cross else 'self'}"]:
-            if item.shape[1] == num_pixels:
-                cross_maps = item.reshape(1, -1, res, res, item.shape[-1])[select]
-                out.append(cross_maps)
+    for key, item in attention_maps.items():
+        item = [it for it in item if it.shape[1] == num_pixels]
+        if filter_fn(key) and len(item) > 0:
+            item = torch.sum(torch.stack(item), axis=0) / len(item)
+            cross_maps = item.reshape(1, -1, res, res, item.shape[-1])[select]
+            out.append(cross_maps)
     out = torch.cat(out, dim=0)
-    out = out.sum(0) / out.shape[0]
+    if avg: out = out.sum(0).permute(2, 0, 1) / out.shape[0]
+    else: out = out.permute(0,3,1,2).reshape(-1, res, res)
     return out
 
 def visualize_crossattention_map(unet, input, res=16):

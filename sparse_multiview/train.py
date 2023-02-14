@@ -46,7 +46,7 @@ from diffusers.utils import check_min_version
 from diffusers.utils.import_utils import is_xformers_available
 from omegaconf import OmegaConf
 import numpy as np
-
+from vis_utils import show_image_relevance
 from multiview import MultiViewDiffusionModel, MultiViewEncoder, MultiViewDataset
 import wandb
 
@@ -91,36 +91,52 @@ def train_epoch(args, accelerator, model, optimizer, lr_scheduler, train_dataloa
             accelerator.save_state(save_path)
             logger.info(f"Saved state to {save_path}")
 
-def evaluate(args, accelerator, model, dataloader, epoch, noises):
+def one_in_key(key, arr):
+    for v in arr:
+        if v in key: return True
+    return False
+
+def evaluate(args, accelerator, model, dataloader, epoch, latents):
     opts_trainer = args.trainer
+    res = opts_trainer.res
     model.eval()
 
     progress_bar = tqdm(range(len(dataloader)), disable=not accelerator.is_local_main_process, position=1)
     progress_bar.set_description(f'Eval [{epoch}]')
 
     total_loss = 0
-    imgs, cross_maps = [[] for noise in noises], []
+    imgs, cross_maps = [[] for latent in latents], []
     for step, batch in enumerate(dataloader):
         if step >= opts_trainer.num_eval:
             break
         with accelerator.accumulate(model):
             loss = model.compute_loss(batch)
-            for i, noise in enumerate(noises):
-                noise = noise.unsqueeze(0)
-                img, cross = model.forward_with_crossattention(batch, noise=noise)
+            for i, latent in enumerate(latents):
+                latent = latent.unsqueeze(0)
+
+                filter_fn = lambda key: 'cross' in key and one_in_key(key, [f'step{k}' for k in [50]]) and one_in_key(key, ['up', 'down', 'mid'])
+                img, attention_maps = model.forward_with_crossattention(batch, latents=latent, filter_fn=filter_fn, avg=True)
+                #img = model.forward(batch, latents=latent)
                 imgs[i].append(np.array(img))
-            cross_maps.append(cross.cpu().numpy())
+
+                if step == 0 and i == 0:
+                    target = batch['target'].cpu()
+                    for j in range(attention_maps.shape[0]):
+                        image = show_image_relevance(attention_maps[j, :, :].cpu(), target)
+                        image = np.array(Image.fromarray(image.astype(np.uint8)).resize((res ** 2, res ** 2)))
+                        cross_maps.append(image)
+
             total_loss += accelerator.gather(loss.item())
         progress_bar.update(1)
         logs = {
             "eval_loss": total_loss / ((step+1)*accelerator.num_processes), 
         }
         progress_bar.set_postfix(**logs)
-    #crosses = {f'cross_{j}': [wandb.Image(cross[:,:,i]) for i in range(cross.shape[-1])] for j, cross in enumerate(cross_maps)}
-    images = {f'sample_{j}': [wandb.Image(img) for img in imgs] for j, imgs in enumerate(imgs)}
+    crosses = {f'crossattention_0_0': [wandb.Image(cross) for cross in cross_maps]}
+    images = {f'sample_{i}_{j}': [wandb.Image(img) for img in imgs] for j, imgs in enumerate(imgs)}
     logs.update({
-        **images
-        #**crosses
+        **images,
+        **crosses
     })
     accelerator.log(logs, step=epoch)
     
@@ -276,7 +292,7 @@ def main(args):
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
         accelerator.init_trackers("multiview_sd", config=vars(args))
-        accelerator.log({f'dataset_target': [wandb.Image(batches[0]['target'].cpu())]})
+        accelerator.log({f'dataset_target': [wandb.Image(batch['target'].cpu()) for batch in batches]})
         accelerator.log({f'dataset_source': [wandb.Image(batch['source'].cpu()) for batch in batches]})
 
         tracker = accelerator.get_tracker('wandb')
@@ -319,14 +335,14 @@ def main(args):
     # Only show the progress bar once on each machine.
     train_progress_bar = tqdm(range(first_epoch*num_update_steps_per_epoch, max_train_steps), disable=not accelerator.is_local_main_process, position=0)
 
-    noises = torch.randn((opts_trainer.num_noises, 4, 64, 64)).cuda()
+    latents = torch.randn((opts_trainer.num_latents, 4, 64, 64)).cuda()
     if opts_trainer.mode == 'train':
         for epoch in range(first_epoch, opts_trainer.num_train_epochs):
             train_epoch(args, accelerator, model, optimizer, lr_scheduler, train_dataloader, epoch, train_progress_bar)
             if accelerator.is_local_main_process:
-                evaluate(args, accelerator, model, val_dataloader, epoch, noises)
+                evaluate(args, accelerator, model, val_dataloader, epoch, latents)
     if opts_trainer.mode == 'eval' and accelerator.is_local_main_process:
-        evaluate(args, accelerator, model, val_dataloader, first_epoch, noises)
+        evaluate(args, accelerator, model, val_dataloader, first_epoch, latents)
 
     # Create the pipeline using using the trained modules and save it.
     # TODO: save
