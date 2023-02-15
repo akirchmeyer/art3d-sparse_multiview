@@ -1,6 +1,6 @@
 trainer:
   mode: 'train'
-  output_dir: "/grogu/user/akirchme/multiview/checkpoints/views5-mae"
+  output_dir: "/grogu/user/akirchme/multiview/checkpoints/views5-mae3"
   logging_dir: 'logs'
   mixed_precision: "no"
   use_8bit_adam: True
@@ -37,19 +37,26 @@ optimizer:
 diffusion:
   sd_model: "stabilityai/stable-diffusion-2-1-base"
   train_multiview_encoder: False
-  with_prior_preservation: False
-  prior_loss_weight: None
+  guidance_scale: 7.5
+  num_inference_steps: 50
+
+  loss_weights:
+    denoise: 1.0
+    prior: None
+    ddim_inv: None
 
 multiview_encoder:
-  model_name: 'mae'
+  model_name: 'vit'
   model_size: 'large'
   view_mask_ratio: 0.75
   dropout: 0.2
   cross_attention_dim: 1024
-  pose_emb_dim: 20
+  concat_pose_embed_dim: 20
+  pose_embed_mode: 'sum'
+  pose_embed_type: 'freq'
 
   mae:
-    model_checkpoint_path: "/grogu/user/akirchme/pretrained/mae"
+    model_checkpoint_path: "/home/sduggal/workspace_df3d/pretrained_models/mae_visualize_vit_large_ganloss.pth"
     resolution: 224
     image_mask_ratio: 0.75
 
@@ -61,9 +68,10 @@ dataset:
   num_images: 1000
   img_data_path: "/grogu/user/akirchme/art3d_sd_webui/fg/dog"
   depth_data_path: "/grogu/user/akirchme/art3d_sd_webui/depth/dog"
-  view_data_path: "/grogu/user/akirchme/art3d_sd_webui/multiview_new/dog/novel_view_rgb"
+  view_data_path: "/grogu/user/akirchme/art3d_sd_webui/multiview/dog/novel_view_rgb"
   mask_data_path: "/grogu/user/akirchme/art3d_sd_webui/masks/dog"
-  meta_data_file: "/grogu/user/akirchme/art3d_sd_webui/metadata_new/dog/multiview_0_300.csv"
+  meta_data_file: "/grogu/user/akirchme/art3d_sd_webui/metadata/dog/multiview_0_300.csv"
+  inv_data_path: "/grogu/user/akirchme/art3d_sd_webui/inversion/dog"
   center_crop: False
   random_flip: False
   cls: 'dog'

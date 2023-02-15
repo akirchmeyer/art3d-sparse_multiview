@@ -117,14 +117,20 @@ def evaluate(args, accelerator, model, dataloader, epoch, latents):
                 filter_fn = lambda key: 'cross' in key and one_in_key(key, [f'step{k}' for k in [50]]) and one_in_key(key, ['up', 'down', 'mid'])
                 img, attention_maps = model.forward_with_crossattention(batch, latents=latent, filter_fn=filter_fn, avg=True)
                 #img = model.forward(batch, latents=latent)
-                imgs[i].append(np.array(img))
+
+                target = batch['target'].cpu()
+                source = batch['source'].cpu()
+                imgs[i].append(np.array(torch.cat([target, source, img])))
 
                 if step == 0 and i == 0:
                     target = batch['target'].cpu()
+                    source = batch['source'].cpu()
                     for j in range(attention_maps.shape[0]):
-                        image = show_image_relevance(attention_maps[j, :, :].cpu(), target)
-                        image = np.array(Image.fromarray(image.astype(np.uint8)).resize((res ** 2, res ** 2)))
-                        cross_maps.append(image)
+                        image_target = show_image_relevance(attention_maps[j, :, :].cpu(), target)
+                        image_source = show_image_relevance(attention_maps[j, :, :].cpu(), source)
+                        image_target = np.array(Image.fromarray(image_target.astype(np.uint8)).resize((res ** 2, res ** 2)))
+                        image_source = np.array(Image.fromarray(image_source.astype(np.uint8)).resize((res ** 2, res ** 2)))
+                        cross_maps.append(np.concatenate([image_target, image_source], axis=-1))
 
             total_loss += accelerator.gather(loss.item())
         progress_bar.update(1)
@@ -192,6 +198,8 @@ def main(args):
     # import correct text encoder class
     model = MultiViewDiffusionModel(args)
     model.freeze_params()
+    model.eval()
+    model.finetune(verbose=True) # debugging
     model.eval()
 
     if opts_trainer.enable_xformers_memory_efficient_attention:
