@@ -20,7 +20,7 @@ def read_metadata(cls, args, subsample_inst_size):
     meta_df = pd.read_csv(args.meta_data_file, dtype={'index': str})
     inst_ids = {}
     inst_data = []
-    meta_df = meta_df.sample(frac = 1) # shuffle
+    #meta_df = meta_df.sample(frac = 1) # shuffle
     for _, row in meta_df.iterrows():
         index = row['filename'].split('/')[1][:-4] # TODO: fix hack
         inst, view = [int(x) for x in index.split('.')]

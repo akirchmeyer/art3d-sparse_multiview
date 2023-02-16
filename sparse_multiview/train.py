@@ -42,7 +42,7 @@ from cross_attention.cross_attention import show_image_relevance
 from dataset import MultiViewDataset, resize_image
 from pipeline import MultiViewDiffusionModel
 import wandb
-
+from pathlib import Path
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.13.0.dev0")
 
@@ -51,9 +51,11 @@ logger = get_logger(__name__)
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser.add_argument("--config", type=str, default=None, required=True)
+    parser.add_argument("--id", type=str, default='0', required=True)
     parser.add_argument("--mode", type=str, default='train', required=True)
     args = parser.parse_args()
-    return OmegaConf.merge({'mode':args.mode}, OmegaConf.load(args.config))
+    args.name = f'{Path(args.config).stem}-{args.id}'
+    return OmegaConf.merge(vars(args), OmegaConf.load(args.config))
 
 def train_epoch(args, accelerator, model, optimizer, lr_scheduler, train_dataloader, epoch, global_step, progress_bar):
     model.eval()
@@ -78,7 +80,7 @@ def train_epoch(args, accelerator, model, optimizer, lr_scheduler, train_dataloa
 
     if (epoch+1) % opts_trainer.checkpointing_epochs == 0:
         if accelerator.is_main_process:
-            save_path = os.path.join(opts_trainer.output_dir, f"checkpoint-{global_step+step}")
+            save_path = os.path.join(opts_trainer.output_dir, args.name, f"checkpoint-{global_step+step}")
             accelerator.save_state(save_path)
             logger.info(f"Saved state to {save_path}")
 
@@ -146,13 +148,17 @@ def evaluate(args, accelerator, model, dataloader, epoch, global_step, latents):
     
 
 def main(args):
-    torch.autograd.set_detect_anomaly(True)
+    #torch.autograd.set_detect_anomaly(True)
+
+
     
     opts_trainer = args.trainer
     opts_optim = args.optimizer
 
-    logging_dir = Path(opts_trainer.output_dir, opts_trainer.logging_dir)
+    logging_dir = Path(opts_trainer.output_dir, args.name, opts_trainer.logging_dir)
     os.makedirs(logging_dir, exist_ok=True)
+    os.makedirs(f'{logging_dir}/wandb', exist_ok=True)
+    os.environ['WANDB_DIR'] = f'{logging_dir}/wandb'
 
     accelerator = Accelerator(
         gradient_accumulation_steps=opts_trainer.gradient_accumulation_steps,
@@ -193,7 +199,7 @@ def main(args):
     # Handle the repository creation
     if accelerator.is_main_process:
         if opts_trainer.output_dir is not None:
-            os.makedirs(opts_trainer.output_dir, exist_ok=True)
+            os.makedirs(os.path.join(opts_trainer.output_dir, args.name), exist_ok=True)
 
     # import correct text encoder class
     model = MultiViewDiffusionModel(args)
@@ -299,7 +305,8 @@ def main(args):
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        accelerator.init_trackers("multiview_sd", config=vars(args))
+        
+        accelerator.init_trackers("multiview_sd", config=vars(args), init_kwargs={"wandb":{"name":args.name}})
         accelerator.log({f'dataset': [wandb.Image(torch.cat([batch['target'].cpu(), resize_image(batch['source'][0,:,:,:].cpu(), (512,512))], axis=-1)) for batch in batches]})
 
         tracker = accelerator.get_tracker('wandb')
@@ -324,7 +331,7 @@ def main(args):
             path = os.path.basename(opts_trainer.resume_from_checkpoint)
         else:
             # Get the mos recent checkpoint
-            dirs = os.listdir(opts_trainer.output_dir)
+            dirs = os.listdir(os.path.join(opts_trainer.output_dir, args.name))
             dirs = [d for d in dirs if d.startswith("checkpoint")]
             dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
             path = dirs[-1] if len(dirs) > 0 else None
@@ -336,7 +343,7 @@ def main(args):
             opts_trainer.resume_from_checkpoint = None
         else:
             accelerator.print(f"Resuming from checkpoint {path}")
-            accelerator.load_state(os.path.join(opts_trainer.output_dir, path))
+            accelerator.load_state(os.path.join(opts_trainer.output_dir, args.name, path))
             first_epoch = int(path.split("-")[1]) + 1
 
     # Only show the progress bar once on each machine.

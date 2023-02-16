@@ -1,5 +1,5 @@
 trainer:
-  output_dir: "/grogu/user/akirchme/multiview/checkpoints/nopose_noddim8"
+  output_dir: "/grogu/user/akirchme/multiview/checkpoints"
   logging_dir: 'logs'
   mixed_precision: "no"
   use_8bit_adam: False
@@ -66,7 +66,7 @@ dataset:
   data_mode: 'no_pose'
   num_images: 1000
   train_subsample_inst_size: 5
-  val_subsample_inst_size: 1
+  val_subsample_inst_size: 5
   resolution: 512
   context_resolution: 224
   img_data_path: "/grogu/user/akirchme/art3d_sd_webui/fg/dog"

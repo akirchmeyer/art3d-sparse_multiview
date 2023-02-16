@@ -1,5 +1,5 @@
 trainer:
-  output_dir: "/grogu/user/akirchme/multiview/checkpoints/nopose_ddim_class_005"
+  output_dir: "/grogu/user/akirchme/multiview/checkpoints"
   logging_dir: 'logs'
   mixed_precision: "no"
   use_8bit_adam: False

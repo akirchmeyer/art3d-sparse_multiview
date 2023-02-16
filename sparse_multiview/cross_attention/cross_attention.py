@@ -31,6 +31,7 @@ class CrossAttnProcessorPatch:
         hidden_states,
         encoder_hidden_states=None,
         attention_mask=None,
+        residual=False,
         **cross_attention_kwargs
     ):
         input = hidden_states
@@ -68,7 +69,7 @@ class CrossAttnProcessorPatch:
         #if not hasattr(attn, 'hidden_states') or attn.hidden_states is None: 
         #    attn.hidden_states = []
         #attn.hidden_states.append(hidden_states)
-        attn.hidden_states = input + hidden_states
+        attn.hidden_states = hidden_states if not residual else hidden_states + input
         
         return hidden_states
 
@@ -99,7 +100,7 @@ class ResidualCrossAttention(nn.Module):
     def forward(self, x, encoder_hidden_states=None, attention_mask=None, multiview_hidden_states=None, **cross_attention_kwargs):
         x = self.text_cross(x, encoder_hidden_states=encoder_hidden_states, attention_mask=attention_mask, **cross_attention_kwargs)
         do_classifier_free_guidance = len(encoder_hidden_states) == 2
-        return x + self.multiview_cross(x, encoder_hidden_states=torch.cat(2*[multiview_hidden_states]) if do_classifier_free_guidance else multiview_hidden_states, attention_mask=attention_mask, **cross_attention_kwargs)
+        return x + self.multiview_cross(x, encoder_hidden_states=torch.cat(2*[multiview_hidden_states]) if do_classifier_free_guidance else multiview_hidden_states, attention_mask=attention_mask, residual=True, **cross_attention_kwargs)
 
 
 def aggregate_hidden_maps(net, cross_attention_cls = "CrossAttention", cross_attention_layer = 'attn2', step=-1, detach=False, clear=True, map_type='hidden'):
