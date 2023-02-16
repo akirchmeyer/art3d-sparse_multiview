@@ -21,7 +21,6 @@ import math
 import os
 import warnings
 from pathlib import Path
-from typing import Optional
 
 import accelerate
 import torch
@@ -31,23 +30,17 @@ import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
-from huggingface_hub import HfFolder, Repository, create_repo, whoami
-from packaging import version
 from PIL import Image
-from torch.utils.data import Dataset
-from torchvision import transforms
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer, PretrainedConfig
-from torch.nn.parallel import DistributedDataParallel 
 import diffusers
-from diffusers import AutoencoderKL, DDPMScheduler, DiffusionPipeline, UNet2DConditionModel
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version
 from diffusers.utils.import_utils import is_xformers_available
 from omegaconf import OmegaConf
 import numpy as np
-from vis_utils import show_image_relevance
-from multiview import MultiViewDiffusionModel, MultiViewEncoder, MultiViewDataset
+from cross_attention.cross_attention import show_image_relevance
+from dataset import MultiViewDataset, resize_image
+from pipeline import MultiViewDiffusionModel
 import wandb
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
@@ -58,36 +51,34 @@ logger = get_logger(__name__)
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser.add_argument("--config", type=str, default=None, required=True)
+    parser.add_argument("--mode", type=str, default='train', required=True)
     args = parser.parse_args()
-    return OmegaConf.load(args.config)
+    return OmegaConf.merge({'mode':args.mode}, OmegaConf.load(args.config))
 
-def train_epoch(args, accelerator, model, optimizer, lr_scheduler, train_dataloader, epoch, progress_bar):
+def train_epoch(args, accelerator, model, optimizer, lr_scheduler, train_dataloader, epoch, global_step, progress_bar):
     model.eval()
     model.finetune()
+    model.check_parameters(verbose=False)
     opts_trainer = args.trainer
-    total_loss, n_batches = 0, 0
 
     progress_bar.set_description(f'Train [{epoch}]')
     for step, batch in enumerate(train_dataloader):
         with accelerator.accumulate(model):
-            loss = model.compute_loss(batch)
-            # https://huggingface.co/blog/accelerate-library
-            total_loss += accelerator.gather(loss.item())
+            loss, losses = model.compute_loss(batch, epoch=epoch)
             accelerator.backward(loss)
-            if accelerator.sync_gradients:
+            if accelerator.sync_gradients and opts_trainer.max_grad_norm != 'None':
                 accelerator.clip_grad_norm_(model.finetunable_parameters(), opts_trainer.max_grad_norm)
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad(set_to_none=opts_trainer.set_grads_to_none)
-        progress_bar.update(1)
-        logs = {"train_loss": total_loss / ((step+1)*accelerator.num_processes), "lr": lr_scheduler.get_last_lr()[0]}
-        progress_bar.set_postfix(**logs)
-    
-    accelerator.log(logs, step=epoch)
+            progress_bar.update(1)
+            logs = {**losses, "lr": lr_scheduler.get_last_lr()[0]}
+            progress_bar.set_postfix(**logs)
+            accelerator.log(logs, step=global_step+step)
 
     if (epoch+1) % opts_trainer.checkpointing_epochs == 0:
         if accelerator.is_main_process:
-            save_path = os.path.join(opts_trainer.output_dir, f"checkpoint-{epoch}")
+            save_path = os.path.join(opts_trainer.output_dir, f"checkpoint-{global_step+step}")
             accelerator.save_state(save_path)
             logger.info(f"Saved state to {save_path}")
 
@@ -96,58 +87,67 @@ def one_in_key(key, arr):
         if v in key: return True
     return False
 
-def evaluate(args, accelerator, model, dataloader, epoch, latents):
+def evaluate(args, accelerator, model, dataloader, epoch, global_step, latents):
     opts_trainer = args.trainer
-    res = opts_trainer.res
     model.eval()
 
-    progress_bar = tqdm(range(len(dataloader)), disable=not accelerator.is_local_main_process, position=1)
+    progress_bar = tqdm(range(opts_trainer.num_eval), disable=not accelerator.is_local_main_process, position=1)
     progress_bar.set_description(f'Eval [{epoch}]')
 
     total_loss = 0
-    imgs, cross_maps = [[] for latent in latents], []
+    attn_keys = ['up', 'down', 'mid']
+    output_imgs, text_maps, view_maps, hidden_maps = [[] for latent in latents], [[] for k in attn_keys], [[] for k in attn_keys], []
     for step, batch in enumerate(dataloader):
         if step >= opts_trainer.num_eval:
             break
-        with accelerator.accumulate(model):
-            loss = model.compute_loss(batch)
-            for i, latent in enumerate(latents):
-                latent = latent.unsqueeze(0)
 
-                filter_fn = lambda key: 'cross' in key and one_in_key(key, [f'step{k}' for k in [50]]) and one_in_key(key, ['up', 'down', 'mid'])
-                img, attention_maps = model.forward_with_crossattention(batch, latents=latent, filter_fn=filter_fn, avg=True)
-                #img = model.forward(batch, latents=latent)
+        #with accelerator.accumulate(model):
+        #    loss, losses = model.compute_loss(batch, epoch=epoch)
+        #    total_loss += accelerator.gather(loss.item())
 
-                target = batch['target'].cpu()
-                source = batch['source'].cpu()
-                imgs[i].append(np.array(torch.cat([target, source, img])))
+        for i, latent in enumerate(latents):
+            output = model(batch, latents=latent.unsqueeze(0))
+            # target, source, output
+            target = 255*(batch['target'].detach().cpu()+1)/2
+            source = 255*(batch['source'].detach().cpu().squeeze(1)+1)/2
+            source = torch.nn.functional.interpolate(source, size=target.shape[-2:], mode='bilinear', align_corners=False)
+            output_imgs[i].append(torch.cat([target.squeeze(0), source.squeeze(0), output['target'], output['pred']], axis=-1))
 
-                if step == 0 and i == 0:
-                    target = batch['target'].cpu()
-                    source = batch['source'].cpu()
-                    for j in range(attention_maps.shape[0]):
-                        image_target = show_image_relevance(attention_maps[j, :, :].cpu(), target)
-                        image_source = show_image_relevance(attention_maps[j, :, :].cpu(), source)
-                        image_target = np.array(Image.fromarray(image_target.astype(np.uint8)).resize((res ** 2, res ** 2)))
-                        image_source = np.array(Image.fromarray(image_source.astype(np.uint8)).resize((res ** 2, res ** 2)))
-                        cross_maps.append(np.concatenate([image_target, image_source], axis=-1))
+            if step == 0 and i == 0:
+                # attention maps
+                # for j, key in enumerate(attn_keys):
+                #     text_attention_maps, view_attention_maps = model.extract_hidden_maps(lambda k: key in k, res=16, step=-1, clear=False, map_type='attention')
+                #     for text_map in text_attention_maps:
+                #         text_maps[j].append(show_image_relevance(text_map.cpu(), target, res=16))
+                #     for view_map in view_attention_maps:
+                #         view_maps[j].append(show_image_relevance(view_map.cpu(), target, res=16))
 
-            total_loss += accelerator.gather(loss.item())
-        progress_bar.update(1)
-        logs = {
-            "eval_loss": total_loss / ((step+1)*accelerator.num_processes), 
-        }
-        progress_bar.set_postfix(**logs)
-    crosses = {f'crossattention_0_0': [wandb.Image(cross) for cross in cross_maps]}
-    images = {f'sample_{i}_{j}': [wandb.Image(img) for img in imgs] for j, imgs in enumerate(imgs)}
-    logs.update({
+                # hidden map
+                target_hidden_map, source_hidden_map = model.extract_hidden_maps(lambda k: True, res=64, step=-1, clear=True, map_type='hidden')
+                #target_hidden_map, source_hidden_map = target_hidden_map.mean(axis=0).unsqueeze(0), source_hidden_map.mean(axis=0).unsqueeze(0)
+                for j in range(len(target_hidden_map)):
+                    hidden_maps.append(torch.cat([target_hidden_map[j]/target_hidden_map[j].mean(), source_hidden_map[j]/source_hidden_map[j].mean()], axis=-1))
+
+        #progress_bar.update(1)
+        #logs = {"eval_loss": total_loss / ((step+1)*accelerator.num_processes)}
+        #progress_bar.set_postfix(**logs, **losses)
+        
+    #text_attention = {f'text_attention_{key}': [wandb.Image(img) for img in text_maps[i]] for i, key in enumerate(attn_keys)} if epoch == 0 else {}
+    #view_attention = {f'view_attention_{key}': [wandb.Image(img) for img in view_maps[i]] for i, key in enumerate(attn_keys)}
+    hidden = {f'hidden_maps': [wandb.Image(img) for img in hidden_maps]}
+    images = {f'sample': wandb.Image(torch.cat([torch.cat([img for img in imgs], axis=2) for imgs in output_imgs], axis=1))}
+    logs = {
         **images,
-        **crosses
-    })
-    accelerator.log(logs, step=epoch)
+        **hidden,
+        #**text_attention,
+        #**view_attention
+    }
+    accelerator.log(logs, step=global_step)
     
 
 def main(args):
+    torch.autograd.set_detect_anomaly(True)
+    
     opts_trainer = args.trainer
     opts_optim = args.optimizer
 
@@ -200,7 +200,6 @@ def main(args):
     model.freeze_params()
     model.eval()
     model.finetune(verbose=True) # debugging
-    model.eval()
 
     if opts_trainer.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -262,18 +261,19 @@ def main(args):
     )
 
     # Dataset and DataLoaders creation:
-    train_dataset = MultiViewDataset(args, mode='train')
+    train_dataset = MultiViewDataset(args, model.tokenizer, mode='train')
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=opts_trainer.train_batch_size,
-        shuffle=True,
+        shuffle=False,
         num_workers=opts_trainer.dataloader_num_workers,
-        #pin_memory=True
+        drop_last=True,
+        pin_memory=True
     )
-    batches = [train_dataset[i] for i in range(5)]
+    batches = [train_dataset[i] for i in range(10)]
 
     # TODO: validation dataset
-    val_dataset = MultiViewDataset(args, mode='val')
+    val_dataset = MultiViewDataset(args, model.tokenizer, mode='val')
     val_dataloader = torch.utils.data.DataLoader(
         val_dataset,
         batch_size=1,
@@ -300,8 +300,7 @@ def main(args):
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
         accelerator.init_trackers("multiview_sd", config=vars(args))
-        accelerator.log({f'dataset_target': [wandb.Image(batch['target'].cpu()) for batch in batches]})
-        accelerator.log({f'dataset_source': [wandb.Image(batch['source'].cpu()) for batch in batches]})
+        accelerator.log({f'dataset': [wandb.Image(torch.cat([batch['target'].cpu(), resize_image(batch['source'][0,:,:,:].cpu(), (512,512))], axis=-1)) for batch in batches]})
 
         tracker = accelerator.get_tracker('wandb')
         #tracker.define_metric("step")
@@ -344,13 +343,14 @@ def main(args):
     train_progress_bar = tqdm(range(first_epoch*num_update_steps_per_epoch, max_train_steps), disable=not accelerator.is_local_main_process, position=0)
 
     latents = torch.randn((opts_trainer.num_latents, 4, 64, 64)).cuda()
-    if opts_trainer.mode == 'train':
+    if args.mode == 'train':
         for epoch in range(first_epoch, opts_trainer.num_train_epochs):
-            train_epoch(args, accelerator, model, optimizer, lr_scheduler, train_dataloader, epoch, train_progress_bar)
+            global_step = epoch*len(train_dataloader)
+            train_epoch(args, accelerator, model, optimizer, lr_scheduler, train_dataloader, epoch, global_step, train_progress_bar)
             if accelerator.is_local_main_process:
-                evaluate(args, accelerator, model, val_dataloader, epoch, latents)
-    if opts_trainer.mode == 'eval' and accelerator.is_local_main_process:
-        evaluate(args, accelerator, model, val_dataloader, first_epoch, latents)
+                evaluate(args, accelerator, model, val_dataloader, epoch, global_step+len(train_dataloader), latents)
+    if args.mode == 'eval' and accelerator.is_local_main_process:
+        evaluate(args, accelerator, model, val_dataloader, first_epoch, 0, latents)
 
     # Create the pipeline using using the trained modules and save it.
     # TODO: save

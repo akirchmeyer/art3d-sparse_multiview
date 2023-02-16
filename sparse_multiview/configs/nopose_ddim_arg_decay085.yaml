@@ -1,0 +1,83 @@
+trainer:
+  output_dir: "/grogu/user/akirchme/multiview/checkpoints/nopose_ddim_arg_decay085"
+  logging_dir: 'logs'
+  mixed_precision: "no"
+  use_8bit_adam: False
+  train_batch_size: 4
+  total_batch_size: 4
+  gradient_accumulation_steps: 1
+  num_train_epochs: 100
+  checkpointing_epochs: 100
+  resume_from_checkpoint: 'latest'
+  set_grads_to_none: False
+  enable_xformers_memory_efficient_attention: False
+  gradient_checkpointing: False
+  seed: null
+  dataloader_num_workers: 8
+  max_grad_norm: 1.0
+  num_eval: 5
+  num_latents: 2
+  res: 16
+
+optimizer:
+  learning_rate: 5e-6
+  scale_lr: False
+  lr_scheduler: "polynomial"
+  lr_warmup_steps: 500
+  lr_num_cycles: 1
+  lr_power: 1.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_weight_decay: 1e-2
+  adam_epsilon: 1e-08
+
+diffusion:
+  sd_model: "stabilityai/stable-diffusion-2-1-base"
+  train_multiview_encoder: False
+  guidance_scale: 7.5
+  num_inference_steps: 50
+
+  loss_weights:
+    denoise: 1
+    prior: null
+    ddim_inv: 1
+  loss_decays:
+    denoise: 1
+    prior: null
+    ddim_inv: 0.85
+
+multiview_encoder:
+  model_name: 'mae'
+  model_size: 'large'
+  residual_ca_dropout: 0.
+  view_mask_ratio: 0.75
+  cross_attention_dim: 1024
+  concat_pose_embed_dim: 4
+  pose_embed_mode: 'concat'
+  pose_embed_type: 'freq'
+
+  mae:
+    model_checkpoint_path: "/home/sduggal/workspace_df3d/pretrained_models/mae_visualize_vit_large_ganloss.pth"
+    resolution: 224
+    image_mask_ratio: 0.75
+
+dataset:
+  cls: 'dog'
+  data_mode: 'no_pose'
+  num_images: 1000
+  train_subsample_inst_size: 5
+  val_subsample_inst_size: 5
+  resolution: 512
+  context_resolution: 224
+  img_data_path: "/grogu/user/akirchme/art3d_sd_webui/fg/dog"
+  depth_data_path: "/grogu/user/akirchme/art3d_sd_webui/depth/dog"
+  view_data_path: "/grogu/user/akirchme/art3d_sd_webui/multiview/dog/novel_view_rgb"
+  mask_data_path: "/grogu/user/akirchme/art3d_sd_webui/masks/dog"
+  meta_data_file: "/grogu/user/akirchme/art3d_sd_webui/metadata/dog/multiview_0_300.csv"
+  inv_data_path: "/grogu/user/akirchme/art3d_sd_webui/inversion/dog"
+  prompt_data_path: "/grogu/user/akirchme/art3d_sd_webui/prompt/fg/dog"
+  center_crop: True
+  random_flip: False
+  prompt: 'photo of a dog, far, side view'
+  neg_prompt: 'drawing, shiny'
+  prompt_mode: 'arg'

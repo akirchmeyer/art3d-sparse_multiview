@@ -61,7 +61,7 @@ class DDIMInversion(BasePipeline):
         num_ac_rolls: int = 5,
     ):
         # set the scheduler to be the Inverse DDIM scheduler
-        self.scheduler = DDIMInverseScheduler.from_config(self.scheduler.config)
+        #self.scheduler = DDIMInverseScheduler.from_config(self.scheduler.config)
 
         device = self._execution_device
         do_classifier_free_guidance = guidance_scale > 1.0
@@ -148,6 +148,6 @@ class DDIMInversion(BasePipeline):
         noise_pred = e_t
 
         # compute the previous noisy sample x_t -> x_t-1
-        latents = self.scheduler.step(noise_pred, t, latents, reverse=True, **extra_step_kwargs).prev_sample
+        latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
 
         return latents
