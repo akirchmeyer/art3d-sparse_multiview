@@ -38,7 +38,7 @@ from diffusers.utils import check_min_version
 from diffusers.utils.import_utils import is_xformers_available
 from omegaconf import OmegaConf
 import numpy as np
-from cross_attention.cross_attention import show_image_relevance
+from cross_attention import show_image_relevance
 from dataset import MultiViewDataset, resize_image
 from pipeline import MultiViewDiffusionModel
 import wandb
@@ -51,328 +51,332 @@ logger = get_logger(__name__)
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser.add_argument("--config", type=str, default=None, required=True)
-    parser.add_argument("--id", type=str, default='0', required=True)
+    parser.add_argument("--name", type=str, default='0', required=True)
     parser.add_argument("--mode", type=str, default='train', required=True)
     args = parser.parse_args()
-    args.name = f'{Path(args.config).stem}-{args.id}'
+    #args.name = f'{Path(args.config).stem}-{args.id}'
     return OmegaConf.merge(vars(args), OmegaConf.load(args.config))
 
-def train_epoch(args, accelerator, model, optimizer, lr_scheduler, train_dataloader, epoch, global_step, progress_bar):
-    model.eval()
-    model.finetune()
-    model.check_parameters(verbose=False)
-    opts_trainer = args.trainer
+class Trainer():
+    def __init__(self, args):
+        self.args = args
+        self.opts_trainer = args.trainer
+        self.opts_optim = args.optimizer
+        self.global_step = 0
 
-    progress_bar.set_description(f'Train [{epoch}]')
-    for step, batch in enumerate(train_dataloader):
-        with accelerator.accumulate(model):
-            loss, losses = model.compute_loss(batch, epoch=epoch)
-            accelerator.backward(loss)
-            if accelerator.sync_gradients and opts_trainer.max_grad_norm != 'None':
-                accelerator.clip_grad_norm_(model.finetunable_parameters(), opts_trainer.max_grad_norm)
-            optimizer.step()
-            lr_scheduler.step()
-            optimizer.zero_grad(set_to_none=opts_trainer.set_grads_to_none)
-            progress_bar.update(1)
-            logs = {**losses, "lr": lr_scheduler.get_last_lr()[0]}
-            progress_bar.set_postfix(**logs)
-            accelerator.log(logs, step=global_step+step)
-
-    if (epoch+1) % opts_trainer.checkpointing_epochs == 0:
-        if accelerator.is_main_process:
-            save_path = os.path.join(opts_trainer.output_dir, args.name, f"checkpoint-{global_step+step}")
-            accelerator.save_state(save_path)
-            logger.info(f"Saved state to {save_path}")
-
-def one_in_key(key, arr):
-    for v in arr:
-        if v in key: return True
-    return False
-
-def evaluate(args, accelerator, model, dataloader, epoch, global_step, latents):
-    opts_trainer = args.trainer
-    model.eval()
-
-    progress_bar = tqdm(range(opts_trainer.num_eval), disable=not accelerator.is_local_main_process, position=1)
-    progress_bar.set_description(f'Eval [{epoch}]')
-
-    total_loss = 0
-    attn_keys = ['up', 'down', 'mid']
-    output_imgs, text_maps, view_maps, hidden_maps = [[] for latent in latents], [[] for k in attn_keys], [[] for k in attn_keys], []
-    for step, batch in enumerate(dataloader):
-        if step >= opts_trainer.num_eval:
-            break
-
-        #with accelerator.accumulate(model):
-        #    loss, losses = model.compute_loss(batch, epoch=epoch)
-        #    total_loss += accelerator.gather(loss.item())
-
-        for i, latent in enumerate(latents):
-            output = model(batch, latents=latent.unsqueeze(0))
-            # target, source, output
-            target = 255*(batch['target'].detach().cpu()+1)/2
-            source = 255*(batch['source'].detach().cpu().squeeze(1)+1)/2
-            source = torch.nn.functional.interpolate(source, size=target.shape[-2:], mode='bilinear', align_corners=False)
-            output_imgs[i].append(torch.cat([target.squeeze(0), source.squeeze(0), output['target'], output['pred']], axis=-1))
-
-            if step == 0 and i == 0:
-                # attention maps
-                # for j, key in enumerate(attn_keys):
-                #     text_attention_maps, view_attention_maps = model.extract_hidden_maps(lambda k: key in k, res=16, step=-1, clear=False, map_type='attention')
-                #     for text_map in text_attention_maps:
-                #         text_maps[j].append(show_image_relevance(text_map.cpu(), target, res=16))
-                #     for view_map in view_attention_maps:
-                #         view_maps[j].append(show_image_relevance(view_map.cpu(), target, res=16))
-
-                # hidden map
-                target_hidden_map, source_hidden_map = model.extract_hidden_maps(lambda k: True, res=64, step=-1, clear=True, map_type='hidden')
-                #target_hidden_map, source_hidden_map = target_hidden_map.mean(axis=0).unsqueeze(0), source_hidden_map.mean(axis=0).unsqueeze(0)
-                for j in range(len(target_hidden_map)):
-                    hidden_maps.append(torch.cat([target_hidden_map[j]/target_hidden_map[j].mean(), source_hidden_map[j]/source_hidden_map[j].mean()], axis=-1))
-
-        #progress_bar.update(1)
-        #logs = {"eval_loss": total_loss / ((step+1)*accelerator.num_processes)}
-        #progress_bar.set_postfix(**logs, **losses)
+        self.init_accelerator()
         
-    #text_attention = {f'text_attention_{key}': [wandb.Image(img) for img in text_maps[i]] for i, key in enumerate(attn_keys)} if epoch == 0 else {}
-    #view_attention = {f'view_attention_{key}': [wandb.Image(img) for img in view_maps[i]] for i, key in enumerate(attn_keys)}
-    hidden = {f'hidden_maps': [wandb.Image(img) for img in hidden_maps]}
-    images = {f'sample': wandb.Image(torch.cat([torch.cat([img for img in imgs], axis=2) for imgs in output_imgs], axis=1))}
-    logs = {
-        **images,
-        **hidden,
-        #**text_attention,
-        #**view_attention
-    }
-    accelerator.log(logs, step=global_step)
-    
+        if self.accelerator.is_main_process:
+            self.accelerator.init_trackers("multiview_sd", config=vars(args), init_kwargs={"wandb":{"name":args.name}})
 
-def main(args):
-    #torch.autograd.set_detect_anomaly(True)
+        assert(not self.args.visualization.hidden_maps or self.args.visualization.samples)
+        self.setup_model()
+        self.setup_dataset()
+        self.setup_optimizer()
+        self.setup_scheduler()
 
+        # Prepare everything with our `accelerator`.
+        self.model, self.optimizer, self.train_dataloader, self.train_dataloader_bs1, self.val_dataloader, self.lr_scheduler = self.accelerator.prepare(self.model, self.optimizer, self.train_dataloader, self.train_dataloader_bs1, self.val_dataloader, self.lr_scheduler)
 
-    
-    opts_trainer = args.trainer
-    opts_optim = args.optimizer
+    def init_accelerator(self):
+        logging_dir = Path(self.opts_trainer.output_dir, self.args.name, self.opts_trainer.logging_dir)
+        os.makedirs(logging_dir, exist_ok=True)
+        os.makedirs(f'{logging_dir}/wandb', exist_ok=True)
+        os.environ['WANDB_DIR'] = f'{logging_dir}/wandb'
 
-    logging_dir = Path(opts_trainer.output_dir, args.name, opts_trainer.logging_dir)
-    os.makedirs(logging_dir, exist_ok=True)
-    os.makedirs(f'{logging_dir}/wandb', exist_ok=True)
-    os.environ['WANDB_DIR'] = f'{logging_dir}/wandb'
-
-    accelerator = Accelerator(
-        gradient_accumulation_steps=opts_trainer.gradient_accumulation_steps,
-        mixed_precision=opts_trainer.mixed_precision,
-        log_with='wandb',
-        logging_dir=logging_dir,
-    )
-
-    # Multi-GPU: adapt batch size / gradient accumulation steps
-    effective_batch_size = opts_trainer.train_batch_size*accelerator.num_processes*opts_trainer.gradient_accumulation_steps
-    print(f'effective_batch_size: {effective_batch_size}')
-    print(f'total_batch_size: {opts_trainer.total_batch_size}')
-    assert(effective_batch_size >= opts_trainer.total_batch_size)
-    assert(effective_batch_size % opts_trainer.total_batch_size == 0)
-    opts_trainer.train_batch_size = (opts_trainer.train_batch_size * opts_trainer.total_batch_size) // effective_batch_size 
-    print(f'train_batch_size: {opts_trainer.train_batch_size}')
-    total_batch_size = opts_trainer.train_batch_size * accelerator.num_processes * opts_trainer.gradient_accumulation_steps
-    assert(total_batch_size == opts_trainer.total_batch_size)
-
-    # Make one log on every process with the configuration for debugging.
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO,
-    )
-    logger.info(accelerator.state, main_process_only=False)
-    if accelerator.is_local_main_process:
-        transformers.utils.logging.set_verbosity_warning()
-        diffusers.utils.logging.set_verbosity_info()
-    else:
-        transformers.utils.logging.set_verbosity_error()
-        diffusers.utils.logging.set_verbosity_error()
-
-    # If passed along, set the training seed now.
-    if opts_trainer.seed is not None:
-        set_seed(opts_trainer.seed)
-
-    # Handle the repository creation
-    if accelerator.is_main_process:
-        if opts_trainer.output_dir is not None:
-            os.makedirs(os.path.join(opts_trainer.output_dir, args.name), exist_ok=True)
-
-    # import correct text encoder class
-    model = MultiViewDiffusionModel(args)
-    model.freeze_params()
-    model.eval()
-    model.finetune(verbose=True) # debugging
-
-    if opts_trainer.enable_xformers_memory_efficient_attention:
-        if is_xformers_available():
-            model.enable_xformers_memory_efficient_attention()
-        else:
-            raise ValueError("xformers is not available. Make sure it is installed correctly")
-
-    if opts_trainer.gradient_checkpointing:
-        model.enable_gradient_checkpointing()
-
-    # Check that all trainable models are in full precision
-    low_precision_error_string = (
-        "Please make sure to always have all model weights in full float32 precision when starting training - even if"
-        " doing mixed precision training. copy of the weights should still be float32."
-    )
-
-    if model.unet.dtype != torch.float32:
-        raise ValueError(
-            f"Unet loaded as datatype {model.unet.dtype}. {low_precision_error_string}"
+        self.accelerator = Accelerator(
+            gradient_accumulation_steps=self.opts_trainer.gradient_accumulation_steps,
+            mixed_precision=self.opts_trainer.mixed_precision,
+            log_with='wandb',
+            logging_dir=logging_dir,
         )
 
-    # if model.multiview_encoder.dtype != torch.float32:
-    #     raise ValueError(
-    #         f"Multiview encoder loaded as datatype {model.multiview_encoder.dtype}."
-    #         f" {low_precision_error_string}"
-    #     )
+        # Multi-GPU: adapt batch size / gradient accumulation steps
+        #effective_batch_size = self.opts_trainer.train_batch_size*self.accelerator.num_processes*self.opts_trainer.gradient_accumulation_steps
+        #print(f'effective_batch_size: {effective_batch_size}')
+        #print(f'total_batch_size: {self.opts_trainer.total_batch_size}')
+        #assert(effective_batch_size >= self.opts_trainer.total_batch_size)
+        #assert(effective_batch_size % self.opts_trainer.total_batch_size == 0)
+        #self.opts_trainer.train_batch_size = (self.opts_trainer.train_batch_size * self.opts_trainer.total_batch_size) // effective_batch_size 
+        #print(f'train_batch_size: {self.opts_trainer.train_batch_size}')
+        total_batch_size = self.opts_trainer.train_batch_size * self.accelerator.num_processes * self.opts_trainer.gradient_accumulation_steps
+        assert(total_batch_size == self.opts_trainer.total_batch_size)
 
-    # Enable TF32 for faster training on Ampere GPUs,
-    # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
-    # https://huggingface.co/docs/diffusers/optimization/fp16
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
+        # Make one log on every process with the configuration for debugging.
+        logging.basicConfig(
+            format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+            datefmt="%m/%d/%Y %H:%M:%S",
+            level=logging.INFO,
+        )
+        logger.info(self.accelerator.state, main_process_only=False)
+        if self.accelerator.is_local_main_process:
+            transformers.utils.logging.set_verbosity_warning()
+            diffusers.utils.logging.set_verbosity_info()
+        else:
+            transformers.utils.logging.set_verbosity_error()
+            diffusers.utils.logging.set_verbosity_error()
 
-    if opts_optim.scale_lr:
-        opts_optim.learning_rate = (
-            opts_optim.learning_rate * opts_trainer.gradient_accumulation_steps * opts_trainer.train_batch_size * accelerator.num_processes
+        # If passed along, set the training seed now.
+        if self.opts_trainer.seed is not None:
+            set_seed(self.opts_trainer.seed)
+
+        # Handle the repository creation
+        if self.accelerator.is_main_process:
+            if self.opts_trainer.output_dir is not None:
+                os.makedirs(os.path.join(self.opts_trainer.output_dir, self.args.name), exist_ok=True)
+        
+        
+        # Enable TF32 for faster training on Ampere GPUs,
+        # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
+        # https://huggingface.co/docs/diffusers/optimization/fp16
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+
+    def setup_model(self):
+        # import correct text encoder class
+        self.model = MultiViewDiffusionModel(self.args)
+        self.model.eval()
+        self.model.finetune(verbose=True) # debugging
+        print('unet params:', sum(p.numel() for p in self.model.parameters()))
+        print('unet trainable params:', sum(p.numel() for p in self.model.parameters() if p.requires_grad))
+        
+
+        if self.opts_trainer.enable_xformers_memory_efficient_attention:
+            if is_xformers_available():
+                self.model.enable_xformers_memory_efficient_attention()
+            else:
+                raise ValueError("xformers is not available. Make sure it is installed correctly")
+
+        if self.opts_trainer.gradient_checkpointing:
+            self.model.enable_gradient_checkpointing()
+
+        # Check that all trainable models are in full precision
+        # low_precision_error_string = (
+        #     "Please make sure to always have all model weights in full float32 precision when starting training - even if"
+        #     " doing mixed precision training. copy of the weights should still be float32."
+        # )
+
+        # if self.model.unet.dtype != torch.float32:
+        #     raise ValueError(
+        #         f"Unet loaded as datatype {self.model.unet.dtype}. {low_precision_error_string}"
+        #     )
+
+        # if self.model.multiview_encoder.dtype != torch.float32:
+        #     raise ValueError(
+        #         f"Multiview encoder loaded as datatype {self.model.multiview_encoder.dtype}."
+        #         f" {low_precision_error_string}"
+        #     ) 
+
+    def setup_optimizer(self):
+        if self.opts_optim.scale_lr:
+            self.opts_optim.learning_rate = (
+                self.opts_optim.learning_rate * self.opts_trainer.gradient_accumulation_steps * self.opts_trainer.train_batch_size * self.accelerator.num_processes
+            )
+
+        # Use 8-bit Adam for lower memory usage or to fine-tune the model in 16GB GPUs
+        if self.opts_trainer.use_8bit_adam:
+            try:
+                import bitsandbytes as bnb
+            except ImportError:
+                raise ImportError(
+                    "To use 8-bit Adam, please install the bitsandbytes library: `pip install bitsandbytes`."
+                )
+
+            optimizer_class = bnb.optim.AdamW8bit
+        else:
+            optimizer_class = torch.optim.AdamW
+
+        # Optimizer creation
+        self.optimizer = optimizer_class(
+            self.model.finetunable_parameters(),
+            lr=self.opts_optim.learning_rate,
+            betas=(self.opts_optim.adam_beta1, self.opts_optim.adam_beta2),
+            weight_decay=self.opts_optim.adam_weight_decay,
+            eps=self.opts_optim.adam_epsilon,
         )
 
-    # Use 8-bit Adam for lower memory usage or to fine-tune the model in 16GB GPUs
-    if opts_trainer.use_8bit_adam:
-        try:
-            import bitsandbytes as bnb
-        except ImportError:
-            raise ImportError(
-                "To use 8-bit Adam, please install the bitsandbytes library: `pip install bitsandbytes`."
-            )
+    def setup_dataset(self):
+        # Dataset and DataLoaders creation:
+        self.train_dataset = MultiViewDataset(self.args, mode='train')
+        self.train_dataloader = torch.utils.data.DataLoader(
+            self.train_dataset,
+            batch_size=self.opts_trainer.train_batch_size,
+            shuffle=True,
+            num_workers=self.opts_trainer.dataloader_num_workers,
+            drop_last=True,
+            pin_memory=True
+        )
 
-        optimizer_class = bnb.optim.AdamW8bit
-    else:
-        optimizer_class = torch.optim.AdamW
+        self.train_dataloader_bs1 = torch.utils.data.DataLoader(
+            self.train_dataset,
+            batch_size=1,
+            shuffle=True,
+            num_workers=self.opts_trainer.dataloader_num_workers,
+            drop_last=True,
+            pin_memory=True
+        )
 
-    # Optimizer creation
-    optimizer = optimizer_class(
-        model.finetunable_parameters(),
-        lr=opts_optim.learning_rate,
-        betas=(opts_optim.adam_beta1, opts_optim.adam_beta2),
-        weight_decay=opts_optim.adam_weight_decay,
-        eps=opts_optim.adam_epsilon,
-    )
+        # TODO: validation dataset
+        self.val_dataset = MultiViewDataset(self.args, mode='val')
+        self.val_dataloader = torch.utils.data.DataLoader(
+            self.val_dataset,
+            batch_size=1,
+            shuffle=True,
+            num_workers=self.opts_trainer.dataloader_num_workers,
+            pin_memory=True
+        )
 
-    # Dataset and DataLoaders creation:
-    train_dataset = MultiViewDataset(args, model.tokenizer, mode='train')
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=opts_trainer.train_batch_size,
-        shuffle=False,
-        num_workers=opts_trainer.dataloader_num_workers,
-        drop_last=True,
-        pin_memory=True
-    )
-    batches = [train_dataset[i] for i in range(10)]
+        if self.accelerator.is_main_process:
+            batches = [self.train_dataset[i] for i in range(10)]
+            self.accelerator.log({f'dataset': [wandb.Image(torch.cat([batch['target'].cpu(), batch['source'].cpu()], axis=-1)) for batch in batches]})
+            #tracker = self.accelerator.get_tracker('wandb')
 
-    # TODO: validation dataset
-    val_dataset = MultiViewDataset(args, model.tokenizer, mode='val')
-    val_dataloader = torch.utils.data.DataLoader(
-        val_dataset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=opts_trainer.dataloader_num_workers,
-        pin_memory=True
-    )
+    def setup_scheduler(self):
+        self.num_update_steps_per_epoch = math.ceil(len(self.train_dataloader) / self.opts_trainer.gradient_accumulation_steps)
+        self.max_train_steps = self.opts_trainer.num_train_epochs * self.num_update_steps_per_epoch
+        self.lr_scheduler = get_scheduler(
+            self.opts_optim.lr_scheduler,
+            optimizer=self.optimizer,
+            num_warmup_steps=self.opts_optim.lr_warmup_steps * self.opts_trainer.gradient_accumulation_steps,
+            num_training_steps=self.max_train_steps * self.opts_trainer.gradient_accumulation_steps,
+            num_cycles=self.opts_optim.lr_num_cycles,
+            power=self.opts_optim.lr_power,
+        )
 
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / opts_trainer.gradient_accumulation_steps)
-    max_train_steps = opts_trainer.num_train_epochs * num_update_steps_per_epoch
-    lr_scheduler = get_scheduler(
-        opts_optim.lr_scheduler,
-        optimizer=optimizer,
-        num_warmup_steps=opts_optim.lr_warmup_steps * opts_trainer.gradient_accumulation_steps,
-        num_training_steps=max_train_steps * opts_trainer.gradient_accumulation_steps,
-        num_cycles=opts_optim.lr_num_cycles,
-        power=opts_optim.lr_power,
-    )
+    def train_epoch(self, epoch, progress_bar):
+        self.model.eval()
+        self.model.finetune()
+        self.model.check_parameters(verbose=False)
 
-    # Prepare everything with our `accelerator`.
-    model, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(model, optimizer, train_dataloader, val_dataloader, lr_scheduler)
+        self.opts_trainer = self.args.trainer
 
-    # We need to initialize the trackers we use, and also store our configuration.
-    # The trackers initializes automatically on the main process.
-    if accelerator.is_main_process:
+        progress_bar.set_description(f'Train [{epoch}]')
+        for step, batch in enumerate(self.train_dataloader):
+            with self.accelerator.accumulate(self.model):
+            
+                loss, losses = self.model.compute_loss(batch, epoch=epoch)
+                self.accelerator.backward(loss)
+                if self.accelerator.sync_gradients and self.opts_trainer.max_grad_norm != 'None':
+                    self.accelerator.clip_grad_norm_(self.model.finetunable_parameters(), self.opts_trainer.max_grad_norm)
+
+                if self.accelerator.sync_gradients:
+                    progress_bar.update(1)
+                    self.global_step += 1
+                    self.optimizer.step()
+                    self.lr_scheduler.step()
+                    self.optimizer.zero_grad(set_to_none=self.opts_trainer.set_grads_to_none)
+                logs = {**losses, "lr": self.lr_scheduler.get_last_lr()[0]}
+                progress_bar.set_postfix(**logs)
+                self.accelerator.log(logs, step=self.global_step)
+
+        if (epoch+1) % self.opts_trainer.checkpointing_epochs == 0:
+            if self.accelerator.is_main_process:
+                save_path = os.path.join(self.opts_trainer.output_dir, self.args.name, f"checkpoint-{self.global_step}")
+                self.accelerator.save_state(save_path)
+                logger.info(f"Saved state to {save_path}")
+
+    def evaluate(self, epoch, name):
+        self.opts_trainer = self.args.trainer
+        self.model.eval()
+
+        match name:
+            case 'val':
+                dataloader = self.val_dataloader
+                num_eval = self.args.visualization.num_val_samples
+            case 'train':
+                dataloader = self.train_dataloader_bs1
+                num_eval = self.args.visualization.num_train_samples
+            case _: raise "Unrecognized option"
+
+        progress_bar = tqdm(range(num_eval), disable=not self.accelerator.is_local_main_process, position=1)
+        progress_bar.set_description(f'Eval [{epoch}]')
+
+        total_loss = 0
+        attn_keys = ['up', 'down', 'mid']
+        res = 64
+        latents = torch.randn((self.args.visualization.num_latents, 4, 64, 64)).cuda()
+        output_imgs, text_maps, view_maps, hidden_maps = [[] for latent in latents], [[] for k in attn_keys], [[] for k in attn_keys], []
         
-        accelerator.init_trackers("multiview_sd", config=vars(args), init_kwargs={"wandb":{"name":args.name}})
-        accelerator.log({f'dataset': [wandb.Image(torch.cat([batch['target'].cpu(), resize_image(batch['source'][0,:,:,:].cpu(), (512,512))], axis=-1)) for batch in batches]})
+        #sum_losses = {}
+        logs = {}
+        for step, batch in enumerate(dataloader):
+            if step >= num_eval:
+                break
+            #with self.accelerator.accumulate(self.model):
+            #    loss, losses = self.model.compute_loss(batch, epoch=epoch)
+            #    losses = {key:self.accelerator.gather(loss) for key, loss in losses.items()}
+            #    sum_losses = {key:sum_losses.get(key,0)+loss for key, loss in losses.items()}
 
-        tracker = accelerator.get_tracker('wandb')
-        #tracker.define_metric("step")
-        #tracker.define_metric("train_loss_ep", step_metric="epoch")
-        #tracker.define_metric("val_loss_ep", step_metric="epoch")
-    # Train!
+            if self.args.visualization.samples:
+                target = 255*(batch['target'].detach().cpu()+1)/2
+                source = 255*(batch['source'].detach().cpu()+1)/2
+                for i, latent in enumerate(latents):
+                    output = self.model(batch, latents=latent.unsqueeze(0))
+                    #output_imgs[i].append(torch.cat([target.squeeze(0), source.squeeze(0), output['target'], output['pred']], axis=-1))
+                    output_imgs[i].append(torch.cat([target.squeeze(0), source.squeeze(0), output['pred']], axis=-1))
 
-    logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Num batches each epoch = {len(train_dataloader)}")
-    logger.info(f"  Num Epochs = {opts_trainer.num_train_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {opts_trainer.train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
-    logger.info(f"  Gradient Accumulation steps = {opts_trainer.gradient_accumulation_steps}")
-    logger.info(f"  Total optimization steps = {max_train_steps}")
+        # Do this only once
+        # hidden map
+        #sum_losses = {f'{key}_{name}':value/num_eval for key, value in sum_losses.keys()}
+        #logs.update(**sum_losses)
+        if self.args.visualization.samples:
+            logs.update({f'sample_{name}': wandb.Image(torch.cat([torch.cat([img for img in imgs], axis=2) for imgs in output_imgs], axis=1))})
+        if self.args.visualization.hidden_maps:
+            target_hidden_map, source_hidden_map = self.model.extract_hidden_maps(lambda k: True, res=res, clear=True)
+            for j in range(len(target_hidden_map)):
+                hidden_maps.append(torch.cat([target_hidden_map[j]/target_hidden_map[j].mean(), source_hidden_map[j]/source_hidden_map[j].mean()], axis=-1))
+            logs.update({f'hidden_maps_{name}': [wandb.Image(img) for img in hidden_maps]})
+        self.accelerator.log(logs, step=self.global_step)
 
-    first_epoch = 0
-    # Potentially load in the weights and states from a previous save
-    if opts_trainer.resume_from_checkpoint:
-        if opts_trainer.resume_from_checkpoint != "latest":
-            path = os.path.basename(opts_trainer.resume_from_checkpoint)
-        else:
-            # Get the mos recent checkpoint
-            dirs = os.listdir(os.path.join(opts_trainer.output_dir, args.name))
-            dirs = [d for d in dirs if d.startswith("checkpoint")]
-            dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
-            path = dirs[-1] if len(dirs) > 0 else None
+    def loop(self):
+        # Train!
+        logger.info("***** Running training *****")
+        logger.info(f"  Num examples = {len(self.train_dataset)}")
+        logger.info(f"  Num batches each epoch = {len(self.train_dataloader)}")
+        logger.info(f"  Num Epochs = {self.opts_trainer.num_train_epochs}")
+        logger.info(f"  Instantaneous batch size per device = {self.opts_trainer.train_batch_size}")
+        logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {self.opts_trainer.total_batch_size}")
+        logger.info(f"  Gradient Accumulation steps = {self.opts_trainer.gradient_accumulation_steps}")
+        logger.info(f"  Total optimization steps = {self.max_train_steps}")
 
-        if path is None:
-            accelerator.print(
-                f"Checkpoint '{opts_trainer.resume_from_checkpoint}' does not exist. Starting a new training run."
-            )
-            opts_trainer.resume_from_checkpoint = None
-        else:
-            accelerator.print(f"Resuming from checkpoint {path}")
-            accelerator.load_state(os.path.join(opts_trainer.output_dir, args.name, path))
-            first_epoch = int(path.split("-")[1]) + 1
+        first_epoch = 0
+        # Potentially load in the weights and states from a previous save
+        if self.opts_trainer.resume_from_checkpoint:
+            if self.opts_trainer.resume_from_checkpoint != "latest":
+                path = os.path.basename(self.opts_trainer.resume_from_checkpoint)
+            else:
+                # Get the mos recent checkpoint
+                dirs = os.listdir(os.path.join(self.opts_trainer.output_dir, self.args.name))
+                dirs = [d for d in dirs if d.startswith("checkpoint")]
+                dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
+                path = dirs[-1] if len(dirs) > 0 else None
 
-    # Only show the progress bar once on each machine.
-    train_progress_bar = tqdm(range(first_epoch*num_update_steps_per_epoch, max_train_steps), disable=not accelerator.is_local_main_process, position=0)
+            if path is None:
+                self.accelerator.print(
+                    f"Checkpoint '{self.opts_trainer.resume_from_checkpoint}' does not exist. Starting a new training run."
+                )
+                self.opts_trainer.resume_from_checkpoint = None
+            else:
+                self.accelerator.print(f"Resuming from checkpoint {path}")
+                self.accelerator.load_state(os.path.join(self.opts_trainer.output_dir, self.args.name, path))
+                first_epoch = int(path.split("-")[1]) + 1
 
-    latents = torch.randn((opts_trainer.num_latents, 4, 64, 64)).cuda()
-    if args.mode == 'train':
-        for epoch in range(first_epoch, opts_trainer.num_train_epochs):
-            global_step = epoch*len(train_dataloader)
-            train_epoch(args, accelerator, model, optimizer, lr_scheduler, train_dataloader, epoch, global_step, train_progress_bar)
-            if accelerator.is_local_main_process:
-                evaluate(args, accelerator, model, val_dataloader, epoch, global_step+len(train_dataloader), latents)
-    if args.mode == 'eval' and accelerator.is_local_main_process:
-        evaluate(args, accelerator, model, val_dataloader, first_epoch, 0, latents)
+        # Only show the progress bar once on each machine.
+        train_progress_bar = tqdm(range(first_epoch*self.num_update_steps_per_epoch, self.max_train_steps), disable=not self.accelerator.is_local_main_process, position=0)
 
-    # Create the pipeline using using the trained modules and save it.
-    # TODO: save
-    accelerator.wait_for_everyone()
-    # if accelerator.is_main_process:
-    #     pipeline = DiffusionPipeline.from_pretrained(
-    #         opts_trainer.sd_model,
-    #         unet=accelerator.unwrap_model(unet),
-    #         text_encoder=accelerator.unwrap_model(multiview_encoder),
-    #         revision=args.revision,
-    #     )
-    #     pipeline.save_pretrained(args.output_dir)
+        if self.args.mode == 'train':
+            for epoch in range(first_epoch, self.opts_trainer.num_train_epochs):
+                self.train_epoch(epoch, train_progress_bar)
+                if self.accelerator.is_local_main_process:
+                    self.evaluate(epoch, 'train')
+                    self.evaluate(epoch, 'val')
+        if self.args.mode == 'eval' and self.accelerator.is_local_main_process:
+            self.evaluate(first_epoch, 'val')
 
-    accelerator.end_training()
+        self.accelerator.wait_for_everyone()
+        self.accelerator.end_training()
 
 if __name__ == "__main__":
     args = parse_args()
-    main(args)
+    trainer = Trainer(args)
+    trainer.loop()
